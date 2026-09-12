@@ -1,0 +1,39 @@
+title: Windows Command Shell Spawned by Unusual Parent (ABR-T002)
+id: 3f9a6c1e-8b2d-4e7f-9c4a-1d6e5b8f2a01
+status: experimental
+description: >
+  Detects a cmd.exe process spawned by a parent that is not a typical
+  interactive shell host. Remote tasking engines such as C2 implants commonly
+  spawn cmd.exe directly from an unrelated process. Maps to Abraham technique
+  ABR-T002 (MITRE ATT&CK T1059.003).
+references:
+  - https://attack.mitre.org/techniques/T1059/003/
+  - https://github.com/sforzin/abraham/blob/main/registry/techniques.yaml
+author: Anthony Sforzin
+date: 2026/09/10
+tags:
+  - attack.execution
+  - attack.t1059.003
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection:
+    Image|endswith: '\cmd.exe'
+  filter_interactive_parents:
+    ParentImage|endswith:
+      - '\explorer.exe'
+      - '\cmd.exe'
+      - '\powershell.exe'
+      - '\pwsh.exe'
+      - '\conhost.exe'
+      - '\windowsterminal.exe'
+      - '\wt.exe'
+      - '\wininit.exe'
+      - '\winlogon.exe'
+      - '\userinit.exe'
+  condition: selection and not filter_interactive_parents
+falsepositives:
+  - Software installers and update agents spawning cmd.exe
+  - IDEs, build systems and terminal emulators not listed in the filter
+level: medium

@@ -1,0 +1,6 @@
+﻿=== hide check 09/12/2026 01:08:52 ===
+Get-Process count: 1
+ERROR: Invalid argument/option - 'IMAGENAME'.
+Type "TASKLIST /?" for usage.
+netstat established to 192.168.162.1: 1 lines
+done

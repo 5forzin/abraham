@@ -1,0 +1,8 @@
+﻿=== diag2 09/12/2026 00:04:09 ===
+old launch log:
+launch 09/12/2026 00:01:45
+implant exited rc=1
+process now:
+started pid=1736 exited=False rc=
+--- stderr ---
+--- stdout ---

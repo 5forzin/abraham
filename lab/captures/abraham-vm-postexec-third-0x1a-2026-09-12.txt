@@ -1,0 +1,47 @@
+﻿collected_utc=2026-09-12T05:20:51.5211156Z
+last_boot=2026-09-12T05:20:15.5000000Z
+=== BugCheck 1001 ===
+time=2026-09-12T02:50:36.5962316Z
+provider=Microsoft-Windows-WER-SystemErrorReporting
+The computer has rebooted from a bugcheck.  The bugcheck was: 0x00000139 (0x0000000000000003, 0xfffff50e97d07590, 0xfffff50e97d074e8, 0x0000000000000000). A dump was saved in: C:\WINDOWS\Minidump\091126-8265-02.dmp. Report Id: 6c01aa3e-572c-41cd-b639-c4ea97cf584f.
+time=2026-09-12T02:10:34.2447179Z
+provider=Microsoft-Windows-WER-SystemErrorReporting
+The computer has rebooted from a bugcheck.  The bugcheck was: 0x00000139 (0x0000000000000003, 0xffffa68df47076b0, 0xffffa68df4707608, 0x0000000000000000). A dump was saved in: C:\WINDOWS\Minidump\091126-8343-02.dmp. Report Id: e8638df8-7141-4b31-843c-e350a6f929ef.
+time=2026-09-12T01:55:33.6077607Z
+provider=Microsoft-Windows-WER-SystemErrorReporting
+The computer has rebooted from a bugcheck.  The bugcheck was: 0x000000be (0xfffff8027ff65258, 0x800000013fa6e021, 0xfffff30978754450, 0x000000000000000b). A dump was saved in: C:\WINDOWS\Minidump\091126-8265-01.dmp. Report Id: 1bed57f2-5119-499b-a8bd-c79221653ff6.
+time=2026-09-12T01:43:16.4009045Z
+provider=Microsoft-Windows-WER-SystemErrorReporting
+The computer has rebooted from a bugcheck.  The bugcheck was: 0x000000be (0xfffff8015a6e1b68, 0x0900000167a02021, 0xffff8084d36ca450, 0x000000000000000b). A dump was saved in: C:\WINDOWS\Minidump\091126-8015-01.dmp. Report Id: 4e89d39a-cd55-4df7-bc5f-061ad01e0fce.
+time=2026-09-12T01:11:16.6377221Z
+provider=Microsoft-Windows-WER-SystemErrorReporting
+The computer has rebooted from a bugcheck.  The bugcheck was: 0x00000018 (0x0000000000000000, 0xffffa985b05a8360, 0x0000000000000002, 0xffffffffffffffff). A dump was saved in: C:\WINDOWS\Minidump\091126-8359-01.dmp. Report Id: be7e2944-2a17-4968-b9ed-e36abadace8d.
+=== Kernel-Power 41 ===
+time=2026-09-12T05:20:21.7272553Z
+provider=Microsoft-Windows-Kernel-Power
+The system has rebooted without cleanly shutting down first. This error could be caused if the system stopped responding, crashed, or lost power unexpectedly.
+BugcheckCode=26
+BugcheckParameter1=0x61941
+BugcheckParameter2=0x0
+BugcheckParameter3=0x0
+BugcheckParameter4=0x0
+SleepInProgress=0
+PowerButtonTimestamp=0
+BootAppStatus=0
+Checkpoint=0
+ConnectedStandbyInProgress=false
+SystemSleepTransitionsToOn=0
+CsEntryScenarioInstanceId=0
+BugcheckInfoFromEFI=true
+CheckpointStatus=0
+CsEntryScenarioInstanceIdV2=0
+LongPowerButtonPressDetected=false
+LidReliability=false
+InputSuppressionState=0
+PowerButtonSuppressionState=0
+LidState=3
+WHEABootErrorCount=0
+=== Minidumps ===
+091126-8265-02.dmp	488446	2026-09-12T02:50:35.2929867Z
+091126-8343-02.dmp	503526	2026-09-12T02:10:32.0786569Z
+091126-8265-01.dmp	514104	2026-09-12T01:55:32.1362016Z

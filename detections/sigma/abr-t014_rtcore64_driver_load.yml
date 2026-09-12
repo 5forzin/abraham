@@ -1,0 +1,35 @@
+title: Known Vulnerable RTCore64 Driver Loaded (ABR-T014)
+id: 7f1c3b8e-9d4a-4c5e-b6f7-0a1b2c3d4e15
+status: experimental
+description: >
+  Detects the load of the MSI RTCore64 driver (CVE-2019-16098 /
+  CVE-2022-22077 family) — the canonical BYOVD arbitrary kernel
+  read/write primitive. Matches Sysmon EID 6 by image name AND by SHA256
+  so renaming the dropped binary does not evade it. The sample hash is
+  from the LOLDrivers entry e32bc3da (lab-validated 2026-09-11); feed
+  the full LOLDrivers hash set in production instead of a single value.
+references:
+  - https://www.loldrivers.io/drivers/e32bc3da-4db1-4858-a62c-6fbe4db6afbd/
+  - https://attack.mitre.org/techniques/T1068/
+  - https://github.com/sforzin/abraham/blob/main/docs/detections/abr-t014.md
+author: Anthony Sforzin
+date: 2026/09/11
+tags:
+  - attack.t1068
+logsource:
+  category: driver_load
+  product: windows
+detection:
+  selection:
+    EventID: 6
+    ImageLoaded|endswith: '\RTCore64.sys'
+  selection_hash:
+    EventID: 6
+    Hashes|contains:
+      - '01AA278B07B58DC46C84BD0B1B5C8E9EE4E62EA0BF7A695862444AF32E87F1FD'
+  condition: selection or selection_hash
+falsepositives:
+  - Machines running MSI Afterburner / MSI Center legitimately (the
+    vendor software loads the same signed image from its install dir —
+    filter on ImageLoaded startswith the vendor path).
+level: critical

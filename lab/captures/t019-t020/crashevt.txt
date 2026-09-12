@@ -1,0 +1,28 @@
+﻿
+
+TimeCreated : 9/12/2026 1:10:57 AM
+Id          : 1001
+M           : The computer has rebooted from a bugcheck.  The bugcheck was: 0x00000139 (0x0000000000000003, 
+              0xfffff904b1c766b0, 0xfffff904b1c76608, 0x0000000000000000). A dump was saved in: 
+              C:\WINDOWS\Minidump\0912
+
+TimeCreated : 9/12/2026 1:10:53 AM
+Id          : 41
+M           : The system has rebooted without cleanly shutting down first. This error could be caused if the system 
+              stopped responding, crashed, or lost power unexpectedly.
+
+TimeCreated : 9/11/2026 10:34:10 PM
+Id          : 41
+M           : The system has rebooted without cleanly shutting down first. This error could be caused if the system 
+              stopped responding, crashed, or lost power unexpectedly.
+
+
+
+minidumps:
+
+Name               LastWriteTime       
+----               -------------       
+091226-9140-01.dmp 9/12/2026 1:10:54 AM
+091126-8265-02.dmp 9/11/2026 7:50:35 PM
+
+

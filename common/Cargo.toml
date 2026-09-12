@@ -1,0 +1,21 @@
+[package]
+name = "abraham-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hkdf = "0.12"
+httparse = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util"] }
+x25519-dalek = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

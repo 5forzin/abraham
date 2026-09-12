@@ -1,0 +1,50 @@
+title: Intel iqvw64e Driver Staged for KDMapper-Style Mapping (ABR-T018)
+id: 8e2f4a1b-7c3d-4f9e-a2b6-5d8c0e1f3a27
+status: experimental
+description: >
+  Detects the loader stage of KDMapper-style unsigned-driver mapping:
+  the legitimately signed Intel "Nal" driver (iqvw64e.sys) installed as
+  a service or loaded from outside System32\drivers. iqvw64e provides
+  the arbitrary kernel read/write + physical mapping + kernel-call
+  surface that manual mappers (TheCruZ/kdmapper and derivatives, and
+  the Abraham ABR-T018 mapper) use to map unsigned drivers into
+  NonPagedPool with no EID 6 signature event for the payload itself —
+  the LOADER is the detectable artifact. Matches the service-install
+  event (name or image path), the Sysmon driver-load event by image
+  name and SHA256, and the CodeIntegrity block when the vulnerable
+  driver blocklist is armed (lab 2026-09-11: 0x800B010C / EID 3023).
+references:
+  - https://www.loldrivers.io/drivers/
+  - https://github.com/TheCruZ/kdmapper
+  - https://attack.mitre.org/techniques/T1068/
+  - https://github.com/sforzin/abraham/blob/main/docs/detections/abr-t018.md
+author: Anthony Sforzin
+date: 2026/09/11
+tags:
+  - attack.t1068
+  - attack.t1543.003
+logsource:
+  category: system
+  product: windows
+detection:
+  selection_service:
+    Provider_Name: 'Service Control Manager'
+    EventID: 7045
+    ServiceName|contains: 'iqvw64e'
+  selection_service_image:
+    Provider_Name: 'Service Control Manager'
+    EventID: 7045
+    ImagePath|contains: 'iqvw64e'
+  selection_driver_load:
+    EventID: 6
+    ImageLoaded|endswith: '\iqvw64e.sys'
+  selection_driver_load_hash:
+    EventID: 6
+    Hashes|contains:
+      - '4429F32DB1CC70567919D7D47B844A91CF1329A6CD116F582305F3B7B60CD60B'
+  condition: 1 of selection_*
+falsepositives:
+  - Intel NIC diagnostics or PXE tooling from the era that shipped
+    this driver (verify against the known-vulnerable hash; modern
+    Intel packages do not carry it).
+level: critical

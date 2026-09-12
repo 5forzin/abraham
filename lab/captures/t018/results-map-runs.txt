@@ -1,0 +1,25 @@
+{
+  "results": [
+    {
+      "kind": "task",
+      "status": 0,
+      "summary": "iqvw64e: deregistered (state at unload: 4; stopped; removed C:\\Users\\lab\\AppData\\Local\\Temp\\iqvw64e.sys)",
+      "task_id": 8,
+      "timestamp": 1789197257
+    },
+    {
+      "kind": "task",
+      "status": 0,
+      "summary": "kdmapper: 12288B image -> 0xffff8e889f089000; relocs 1, imports 1; entry rc 0x0; scratch 0x610defaced - KERNEL CODE EXECUTION PROVEN (iqvw64e manual map)",
+      "task_id": 7,
+      "timestamp": 1789197208
+    },
+    {
+      "kind": "task",
+      "status": 0,
+      "summary": "kdmapper: 12288B image -> 0xffff8e889f089000; relocs 1, imports 1; entry rc 0x0; scratch 0x610defaced - KERNEL CODE EXECUTION PROVEN (iqvw64e manual map)",
+      "task_id": 6,
+      "timestamp": 1789197175
+    }
+  ]
+}

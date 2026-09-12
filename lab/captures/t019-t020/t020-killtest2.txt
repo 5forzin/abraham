@@ -1,0 +1,22 @@
+﻿=== protect kill test 09/12/2026 01:21:02 ===
+process before:
+
+  Id
+  --
+2440
+
+
+--- Stop-Process attempt ---
+Stop-Process DENIED: Cannot stop process "abraham-implant (2440)" because of the following error: Access is denied
+--- taskkill attempt ---
+ERROR: The process "abraham-implant.exe" with PID 2440 could not be terminated.
+Reason: Access is denied.
+
+process after:
+
+  Id
+  --
+2440
+
+
+done

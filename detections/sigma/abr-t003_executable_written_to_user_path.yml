@@ -1,0 +1,42 @@
+title: Executable File Written to User-Writable Path (ABR-T003)
+id: 8c2f9d3a-1b4e-4f6a-9c7d-2e8b5a3f1c02
+status: experimental
+description: >
+  Detects the creation of executable or scriptable files in user-writable
+  locations (user profile, Temp, ProgramData). A common pattern for tooling
+  delivered through an implant's upload capability. Maps to Abraham technique
+  ABR-T003 (MITRE ATT&CK T1105).
+references:
+  - https://attack.mitre.org/techniques/T1105/
+  - https://github.com/sforzin/abraham/blob/main/registry/techniques.yaml
+author: Anthony Sforzin
+date: 2026/09/10
+tags:
+  - attack.command-and-control
+  - attack.t1105
+logsource:
+  category: file_event
+  product: windows
+detection:
+  selection_filetype:
+    TargetFilename|endswith:
+      - '.exe'
+      - '.dll'
+      - '.ps1'
+      - '.bat'
+      - '.cmd'
+  selection_path:
+    TargetFilename|contains:
+      - '\Users\'
+      - '\Windows\Temp\'
+      - '\ProgramData\'
+  condition: selection_filetype and selection_path
+falsepositives:
+  - Browsers and download managers writing to the Downloads folder
+  - Legitimate software updating itself from user-writable paths
+notes: >
+  Lab observation (2026-09-10, Sysmon 15.22, SwiftOnSecurity config): EID 11
+  fired on fresh file creation but not when an existing file of the same name
+  was overwritten. Treat this rule as creation-only coverage; pair with USN
+  journal or ETW file tracing for overwrite activity.
+level: low

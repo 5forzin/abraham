@@ -1,0 +1,26 @@
+# Rust
+target/
+*.pdb
+*.obj
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Lab runtime state (captures of textual evidence ARE tracked under
+# lab/captures/ - they are the exhibits the registry cites)
+loot/
+*.pcapng
+*.evtx
+*.etl
+*.dmp
+
+# Server identity material is generated per deployment and stays local
+*.pem
+*.key
+*.pub
+
+# OS
+Thumbs.db
+.DS_Store

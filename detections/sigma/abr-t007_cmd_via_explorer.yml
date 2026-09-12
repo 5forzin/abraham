@@ -1,0 +1,34 @@
+title: Windows Command Shell with Explorer Parent and /C (ABR-T007)
+id: 7a4e6c2b-1d93-4f58-a6e0-9b2c7d5f4a03
+status: experimental
+description: >
+  Detects cmd.exe launched with /C and explorer.exe recorded as its parent.
+  ABR-T007 uses an explicit parent-process attribute to create this lineage,
+  which is excluded as an interactive parent by the companion ABR-T002 rule.
+  Maps to Abraham technique ABR-T007 (MITRE ATT&CK T1134.004).
+references:
+  - https://attack.mitre.org/techniques/T1134/004/
+  - https://github.com/sforzin/abraham/blob/main/registry/techniques.yaml
+author: Anthony Sforzin
+date: 2026/09/10
+tags:
+  - attack.t1134.004
+  - attack.execution
+  - attack.t1059.003
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection:
+    Image|endswith: '\cmd.exe'
+    ParentImage|endswith: '\explorer.exe'
+    CommandLine|contains: ' /C '
+  condition: selection
+falsepositives:
+  - A user launching a batch or command file from Windows Explorer
+  - Legitimate desktop software launching cmd.exe through the Explorer process
+notes: >
+  Use as a companion to ABR-T002. ParentImage is caller-controlled when an
+  explicit parent-process attribute is used, so corroborate matches with
+  process ancestry, token, signer and handle-access telemetry where available.
+level: medium

@@ -1,0 +1,14 @@
+﻿=== protect kill test 09/12/2026 02:09:56 ===
+process before:
+
+  Id
+  --
+5948
+
+
+--- Stop-Process attempt ---
+Stop-Process SUCCEEDED (protection ineffective)
+--- taskkill attempt ---
+ERROR: The process "abraham-implant.exe" not found.
+process after:
+done

@@ -1,0 +1,497 @@
+schema_version: 1
+
+registry:
+  name: Abraham Technique Registry
+  description: >
+    Single source of truth for every offensive capability implemented in
+    Abraham. A technique without a mapped detection artifact is not merged.
+
+techniques:
+  - id: ABR-T001
+    name: Encrypted C2 channel over HTTPS
+    description: >
+      The implant establishes an end-to-end encrypted session (X25519 ECDHE
+      handshake, HKDF-SHA256 key derivation, AES-256-GCM framing) tunneled
+      inside HTTPS to the teamserver listener.
+    mitre_attack:
+      - T1071.001
+      - T1573
+    component: implant::transport
+    phase: 1
+    status: experimental
+    lab_validated: 2026-09-10
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t001.md
+        status: experimental
+
+  - id: ABR-T002
+    name: Remote command execution via cmd.exe
+    description: >
+      The implant executes operator tasks by spawning cmd.exe and returning
+      stdout/stderr as a task result.
+    mitre_attack:
+      - T1059.003
+    component: implant::exec
+    phase: 1
+    status: experimental
+    lab_validated: 2026-09-10
+    detections:
+      - type: sigma
+        path: detections/sigma/abr-t002_suspicious_cmd_parent.yml
+        status: experimental
+
+  - id: ABR-T003
+    name: Implant file upload and download
+    description: >
+      The implant writes operator-delivered payloads to user-writable paths
+      (upload) and exfiltrates files back to the teamserver (download).
+    mitre_attack:
+      - T1105
+    component: implant::fs
+    phase: 1
+    status: experimental
+    lab_validated: 2026-09-10
+    detections:
+      - type: sigma
+        path: detections/sigma/abr-t003_executable_written_to_user_path.yml
+        status: experimental
+
+  - id: ABR-T004
+    name: Jittered task polling
+    description: >
+      The implant polls the teamserver for tasks on a configurable sleep
+      interval with randomized jitter to mimic irregular interactive traffic.
+    mitre_attack:
+      - T1071.001
+    component: implant::transport
+    phase: 1
+    status: experimental
+    lab_validated: 2026-09-10
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t004.md
+        status: experimental
+
+  - id: ABR-T005
+    name: Indirect syscalls
+    description: >
+      The implant resolves system service numbers from ntdll at runtime and
+      invokes NT APIs through a syscall;ret gadget inside ntdll, avoiding the
+      normal exported user-mode syscall entry point.
+    mitre_attack:
+      - T1106
+    component: implant::evasion::syscalls
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t005.md
+        status: experimental
+
+  - id: ABR-T006
+    name: Ekko-style sleep obfuscation
+    description: >
+      The implant uses waitable-timer APC completion routines to make its
+      executable section writable, encrypt it with RC4 while dormant, restore
+      the plaintext and executable protection, and then resume execution.
+    mitre_attack:
+      - T1027
+      - T1497.003
+    component: implant::evasion::sleep
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t006.md
+        status: experimental
+
+  - id: ABR-T007
+    name: PPID spoofing with child-process DLL restrictions
+    description: >
+      The implant creates command shells with explorer.exe as their reported
+      parent through PROC_THREAD_ATTRIBUTE_PARENT_PROCESS and applies a
+      mitigation policy that blocks non-Microsoft-signed DLLs in the child.
+    mitre_attack:
+      - T1134.004
+    component: implant::evasion::spoof
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: sigma
+        path: detections/sigma/abr-t007_cmd_via_explorer.yml
+        status: experimental
+      - type: guidance
+        path: docs/detections/abr-t007.md
+        status: experimental
+
+  - id: ABR-T008
+    name: Dynamic unwind metadata for unbacked code
+    description: >
+      The implant registers RUNTIME_FUNCTION/UNWIND_INFO entries through
+      RtlAddFunctionTable for its hand-assembled routines on private
+      executable pages, so stack walks restore those frames' real contexts
+      like legitimate JIT code instead of misattributing them as leaf
+      frames and derailing onto the routines' parked stack data.
+      Concept adapted from the Morgana prototype.
+    mitre_attack:
+      - T1027
+    component: implant::evasion::unwind
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t008.md
+        status: experimental
+
+  - id: ABR-T009
+    name: Pristine syscall numbers from KnownDlls
+    description: >
+      The implant maps \KnownDlls\ntdll.dll read-only through indirect
+      NtOpenSection/NtMapViewOfSection syscalls and reads untouched
+      syscall stubs from that view, falling back to it when the local
+      ntdll stubs and all their neighbours are hooked. No disk read is
+      involved. Concept adapted from the Morgana prototype.
+    mitre_attack:
+      - T1562.001
+      - T1106
+    component: implant::evasion::syscalls
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t009.md
+        status: experimental
+
+  - id: ABR-T010
+    name: Call-stack spoofing for indirect syscalls
+    description: >
+      The implant dispatches syscalls with rsp pivoted to a synthetic
+      stack whose frames are return addresses into kernel32/ntdll anchor
+      functions, placed at the exact offsets a stack walker computes from
+      those functions' real unwind metadata, so telemetry stack walks
+      attribute every frame to system modules instead of the implant
+      image. Degrades to the plain indirect dispatcher when a user-mode
+      shadow stack is enforced. Concept adapted from the Morgana
+      prototype.
+    mitre_attack:
+      - T1027
+    component: implant::evasion::stack
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t010.md
+        status: experimental
+  - id: ABR-T011
+    name: In-process task modules
+    description: >
+      The implant executes routine collection (process enumeration via
+      NtQuerySystemInformation, directory listing, capped file read,
+      self-identification) as built-in modules inside its own process on
+      the session thread, dispatching NT calls through the indirect
+      syscall layer with a spoofed call stack. No child processes, no
+      new threads, no console hosts.
+    mitre_attack:
+      - T1106
+      - T1082
+    component: implant::modules
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t011.md
+        status: experimental
+  - id: ABR-T012
+    name: Phantom DLL stomping for the code home
+    description: >
+      The implant maps a signed System32 DLL as an image section through
+      direct syscalls without the loader, carves its ekko routines and
+      dynamic unwind metadata out of the DLL's .text via copy-on-write
+      flips, and executes them from a MEM_IMAGE region named after the
+      legitimate file — removing the MEM_PRIVATE executable-memory
+      tripwire while staying absent from the module list.
+    mitre_attack:
+      - T1027
+      - T1106
+    component: implant::evasion::stomp
+    phase: 2
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t012.md
+        status: experimental
+  - id: ABR-T013
+    name: Kernel-driver staging lifecycle via the SCM
+    description: >
+      The implant copies a driver file to a staging path, registers a
+      demand-start kernel service on it through OpenSCManagerW /
+      CreateServiceW / StartServiceW resolved via the manual export walk,
+      and starts it — or stops, deregisters and deletes it. Stage 3.1 of
+      the BYOVD chain, exercised against benign signed drivers (a copy of
+      null.sys) before any vulnerable driver is involved. The full
+      footprint (service install with an ImagePath outside
+      System32\drivers, driver load of the staged file, Type=1 service
+      registry key) is deliberate detection material.
+    mitre_attack:
+      - T1543.003
+      - T1068
+    component: implant::driver
+    phase: 3
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t013.md
+        status: experimental
+      - type: sigma
+        path: detections/sigma/abr-t013_driver_service_imagepath_outside_system32.yml
+        status: experimental
+  - id: ABR-T014
+    name: Kernel read/write via operator-supplied vulnerable driver
+    description: >
+      The implant opens the device of a vulnerable signed driver staged
+      by the operator over C2 upload and loaded through the ABR-T013
+      lifecycle, then speaks its protocol for arbitrary kernel virtual
+      read/write. Shipped client: RTCore64 (CVE-2019-16098 family,
+      48-byte METHOD_BUFFERED struct, IOCTLs 0x80002048/0x8000204C);
+      the client surface is pluggable per driver. The probe action
+      proves the primitive by leaking the ntoskrnl base through spoofed
+      NtQuerySystemInformation(SystemModuleInformation) and reading its
+      MZ header through the driver. No vulnerable driver binaries in
+      this repository, ever.
+    mitre_attack:
+      - T1068
+    component: implant::vdm
+    phase: 3
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t014.md
+        status: experimental
+      - type: sigma
+        path: detections/sigma/abr-t014_rtcore64_driver_load.yml
+        status: experimental
+
+  - id: ABR-T015
+    name: EPROCESS token swap via kernel write primitive
+    description: >
+      With the ABR-T014 kernel read/write primitive live, the implant
+      resolves PsInitialSystemProcess through ntoskrnl's in-memory
+      export table, walks ActiveProcessLinks to its own EPROCESS with
+      offset sanity checks (System PID == 4, own PID match, EX_FAST_REF
+      shape), swaps its token slot for the System token, proves SYSTEM
+      in-process via the SAM hive DACL and restores the original
+      token. No native telemetry exists for the swap itself; the
+      detection guidance keys on the prerequisite chain and token
+      sweeps. Experimental: first live attempt bugchecked the lab
+      (0x3B, see docs/lab/2026-09-11-byovd-phase3.md Part 4); retry
+      gated on a VM snapshot.
+    mitre_attack:
+      - T1134
+      - T1068
+    component: implant::vdm
+    phase: 3
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t015.md
+        status: experimental
+
+  - id: ABR-T016
+    name: DKOM process hiding via kernel write primitive
+    description: >
+      The implant discovers every GLOBAL process list inside the System
+      EPROCESS by structural signature (circular walk passing its own
+      PID, list length matching the live SystemProcessInformation
+      count - the discriminator that excludes session/job/thread lists,
+      whose unlink corrupts kernel-audited state), unlinks its own
+      EPROCESS from each with verified neighbor updates, and can relink
+      with a guarded restore that refuses stale neighbors. Lab-verified
+      round-trip on build 26200; documented 2026 limitation: 24H2+
+      tasklist/PSI enumerate via PspAllProcess, so classic DKOM no
+      longer hides from them - the enumeration-source diff that this
+      enables is the technique's own detection.
+    mitre_attack:
+      - T1564.008
+      - T1014
+    component: implant::vdm
+    phase: 3
+    status: experimental
+    lab_validated: 2026-09-11
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t016.md
+        status: experimental
+
+  - id: ABR-T017
+    name: Kernel function calls via call-capable driver (iqvw64e client)
+    description: >
+      Kernel code-execution capability over the driver shortlist. Two
+      paths: the iqvw64e/Nal client (arbitrary kernel/user memcpy,
+      VA-to-PA, MmMapIoSpace RX-bypass writes, kernel CALL via a
+      movabs-jmp stub over nt!NtAddAtom) for hosts where that driver
+      loads, and the dual-driver RTCore64+WinIo64 proof for current
+      builds where every famous certificate is revoked but WinIo still
+      loads: WinIo maps the physical frame behind RTCore64s
+      runtime-read-only INIT section as a fresh RW view, the v1b
+      dispatch-table stub lands there, and NtQueryIntervalProfile fires
+      it in kernel context with full restore. System CR3 discovered
+      structurally (the 24H2 KPROCESS restructure retired the classic
+      +0x28 table). Revoked-driver attempts (iqvw64e, gdrv, MsIo64)
+      fail 0x800B010C with CodeIntegrity 3023/3077/3089 - enforced
+      independent of HVCI, test-signing and trust-list tampering (lab
+      Parts 8-9). The dual-driver CALL is not lab-validated: three live
+      runs reproduced 0x1A/0x61941, and a fourth read-only preflight run
+      reproduced it before any write or kernel trigger. Both dual-driver
+      actions now fail closed pending exact-driver ABI validation and a
+      dump-backed root cause.
+    mitre_attack:
+      - T1068
+    component: implant::vdm
+    phase: 3
+    status: experimental
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t017.md
+        status: experimental
+      - type: sigma
+        path: detections/sigma/abr-t017_revoked_driver_load_attempt.yml
+        status: experimental
+
+  - id: ABR-T018
+    name: KDMapper-style unsigned-driver mapping via iqvw64e
+    description: >
+      Kernel code execution by manual mapping: with the signed Intel
+      "Nal" driver (iqvw64e.sys) loaded through the SCM, an unsigned
+      driver PE is allocated into NonPagedPool via a real
+      ExAllocatePoolWithTag call through the NtAddAtom trampoline,
+      staged entirely in implant memory (sections, DIR64 relocations,
+      imports resolved against the live kernel export tables of the
+      NtQuerySystemInformation module list), copied in with readback
+      verification, and its DriverEntry invoked through the call
+      primitive. No payload service, no payload file on disk, no
+      signature event for the mapped image. The builtin proof payload
+      is generated in memory (import call + relocated absolute
+      reference + magic stamp into a caller-supplied kernel scratch
+      buffer) and its semantics are unit-tested by executing it in a
+      usermode RWX view through the same staging code. Depends on the
+      Microsoft Vulnerable Driver Blocklist being disabled (stock
+      24H2 rejects the loader with 0x800B010C / CodeIntegrity
+      3023-family - lab Parts 8-9); detection therefore anchors on the
+      loader (EID 7045/6, hash-matched) and on the CI\Config switch.
+      Port of the reference flow (TheCruZ/kdmapper MapDriver +
+      intel_driver.cpp) with Abraham safety additions: abort on
+      unsupported relocation types, abort on unresolved imports (no
+      nullstubs), pool free on every early return, readback check
+      before the entry call.
+    mitre_attack:
+      - T1068
+      - T1543.003
+    component: implant::mapper
+    phase: 3
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t018.md
+        status: experimental
+      - type: sigma
+        path: detections/sigma/abr-t018_iqvw64e_kdmapper_driver_load.yml
+        status: experimental
+
+  - id: ABR-T019
+    name: Module DKOM on PsLoadedModuleList + serviceless loader
+    description: >
+      Driver-stage evasiveness. The SCM load deregisters the service
+      and deletes the staged file immediately after a successful start
+      (KDMapper parity): the image stays mapped, the device answers,
+      and `sc query`/Get-Service/the Services registry show nothing
+      (EID 7045 at install time remains the irreducible signal). On
+      top of that, DKOM unlinks the loader's KLDR_DATA_TABLE_ENTRY
+      from nt!PsLoadedModuleList (InLoadOrderLinks; BaseDllName
+      matched at +0x58/+0x60; neighbors saved for a guarded relink) -
+      every enumeration built on that list goes blind. Runs over the
+      client-agnostic RwClient surface (iqvw64e preferred, RTCore64
+      fallback). Restores refuse stale relinks exactly like the
+      process DKOM (ABR-T016).
+    mitre_attack:
+      - T1014
+      - T1562.001
+    component: implant::vdm
+    phase: 3
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t019.md
+        status: experimental
+  - id: ABR-T020
+    name: EPROCESS.Protection spoof (protected-process anti-kill)
+    description: >
+      Copies the SYSTEM process's EPROCESS.Protection byte onto the
+      implant: termination attempts from every unprotected context
+      (admin taskkill, PowerShell Stop-Process, most EDR
+      kill-switches) return ACCESS DENIED while the process keeps
+      running. The offset is confirmed at runtime against three
+      references (System and winlogon must hold plausible
+      Signer/Type nibbles, the implant must read unprotected) before
+      any write; the write is a qword read-modify-write with
+      readback. `protect off` restores the saved byte. Runs over
+      RwClient (iqvw64e preferred).
+    mitre_attack:
+      - T1055.012
+      - T1562.001
+    component: implant::vdm
+    phase: 3
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t020.md
+        status: experimental
+
+  - id: ABR-T021
+    name: Resident km payload with covert channel and kernel-side self-protection
+    description: >
+      Our own unsigned kernel driver, mapped resident through the
+      KDMapper path (ABR-T018): payloads/abraham-km is freestanding
+      Rust with ZERO PE imports, linked by rust-lld as a native driver
+      (/SUBSYSTEM:NATIVE /ENTRY:DriverEntry) - no WDK, no MSVC env, no
+      SCM. The mapper provisions the covert channel at map time:
+      param1 = zeroed shared NonPagedPool block (magic, implant pid,
+      and the live-discovered EPROCESS offsets pre-filled), param2 =
+      kernel function table (KeInitializeTimer/KeInitializeDpc/
+      KeSetTimerEx/KeCancelTimer addresses plus the
+      PsInitialSystemProcess data-export address). A 2s timer DPC owns
+      a heartbeat the implant polls through the iqvw64e read
+      primitive (no device, no IRP, no handles, no named objects) and
+      a command protocol: ping, protect <pid>, unprotect, stop. While
+      protect is active, EVERY tick re-copies the SYSTEM process's
+      EPROCESS.Protection byte onto the target - self-healing
+      anti-kill that survives usermode resets and keeps working even
+      if the implant dies. Detection anchors on the loader chain
+      (EID 7045/iqvw64e, ABR-T018/T019) and on pool-resident
+      driver-less code (no image entry, callbacks/timers with no
+      module).
+    mitre_attack:
+      - T1543.003
+      - T1055.012
+    component: implant::mapper
+    phase: 3
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t021.md
+        status: experimental

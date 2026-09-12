@@ -1,0 +1,12 @@
+# Abraham malleable transport profile (Phase 1).
+# Consumed by the teamserver (--profile) and optionally by the implant
+# (--profile). The implant may also override pieces via --ua / --uri /
+# --sleep / --jitter. Changes require an implant reconnect to apply.
+uris:
+  - /api/v1/telemetry
+  - /cdn/update
+  - /static/config
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+server_header: nginx
+sleep_secs: 5
+jitter: 0.25

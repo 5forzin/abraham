@@ -1,0 +1,16 @@
+[package]
+name = "abraham-implant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+abraham-common = { path = "../common" }
+anyhow = "1"
+ed25519-dalek = "2"
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

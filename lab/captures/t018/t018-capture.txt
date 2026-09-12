@@ -1,0 +1,48 @@
+﻿=== t018 evidence capture 09/12/2026 00:13:59 ===
+--- SCM 7045 iqvw64e ---
+
+
+TimeCreated : 9/12/2026 12:04:38 AM
+Msg         : A service was installed in the system.
+              
+              Service Name:  iqvw64e
+              Service File Name:  \??\C:\Users\lab\AppData\Local\Temp\iqvw64e.sys
+              Service Type:  kernel mode driver
+              Service Start Type:  demand start
+              Service Account:  
+
+
+
+--- driver load events (CodeIntegrity / Kernel-PnP for iqvw64e) ---
+--- CI config now ---
+
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Config
+    VulnerableDriverBlocklistEnable    REG_DWORD    0x0
+
+--- iqvw64e service state ---
+
+SERVICE_NAME: iqvw64e 
+        TYPE               : 1  KERNEL_DRIVER  
+        STATE              : 4  RUNNING 
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+--- uptime (healthy) ---
+
+Friday, September 11, 2026 11:54:06 PM
+
+
+--- minidumps (should be none new) ---
+
+Name               LastWriteTime       
+----               -------------       
+091126-8015-01.dmp 9/11/2026 6:43:14 PM
+091126-8265-01.dmp 9/11/2026 6:55:32 PM
+091126-8265-02.dmp 9/11/2026 7:50:35 PM
+091126-8343-02.dmp 9/11/2026 7:10:32 PM
+091126-8359-01.dmp 9/11/2026 6:11:15 PM
+
+
+done

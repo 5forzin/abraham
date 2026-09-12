@@ -1,0 +1,15 @@
+{
+  "sessions": [
+    {
+      "addr": "192.168.162.128:49770",
+      "arch": "x64",
+      "hostname": "ABRAHAM",
+      "id": 6,
+      "implant_version": "0.1.0",
+      "integrity_level": 1,
+      "last_seen": 1789197276,
+      "pid": 2400,
+      "user": "Abraham\\lab"
+    }
+  ]
+}

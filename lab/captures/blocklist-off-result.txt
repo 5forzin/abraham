@@ -1,0 +1,8 @@
+﻿checked_utc=2026-09-12T05:55:47.2104674Z
+last_boot_utc=2026-09-12T05:52:24.5000000Z
+registry_path=HKLM\SYSTEM\CurrentControlSet\Control\CI\Config
+value_name=VulnerableDriverBlocklistEnable
+before=
+after=0
+vbs_registry=
+hvci_registry=

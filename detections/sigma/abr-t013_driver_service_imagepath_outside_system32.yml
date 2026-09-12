@@ -1,0 +1,40 @@
+title: Kernel Driver Service Installed Outside System32 Drivers (ABR-T013)
+id: 4d7e2a9f-6c1b-4e8a-b3d5-9f0a2c7e8b13
+status: experimental
+description: >
+  Detects the installation of a kernel-driver service (Type 1 / 0x1 in
+  Sysmon EID 7045's ServiceType field, or a classic driver ImagePath form)
+  whose ImagePath points outside %SystemRoot%\System32\drivers. Legitimate
+  driver installs almost always stage under System32\drivers; a staged
+  driver in a user-writable path (Temp, user profile, ProgramData) is the
+  canonical BYOVD / unsigned-driver-mapping setup step. Maps to Abraham
+  technique ABR-T013 (MITRE ATT&CK T1543.003, T1068).
+references:
+  - https://attack.mitre.org/techniques/T1543/003/
+  - https://www.loldrivers.io/
+  - https://github.com/sforzin/abraham/blob/main/docs/detections/abr-t013.md
+author: Anthony Sforzin
+date: 2026/09/11
+tags:
+  - attack.persistence
+  - attack.t1543.003
+  - attack.t1068
+logsource:
+  category: system
+  product: windows
+  service: service-manager
+detection:
+  selection:
+    Provider_Name: 'Service Control Manager'
+    EventID: 7045
+    ServiceType|contains: 'kernel driver'
+  filter_legit_paths:
+    ImagePath|contains:
+      - '\System32\drivers\'
+      - '\DriverStore\'
+  condition: selection and not filter_legit_paths
+falsepositives:
+  - Rare vendor installers that stage drivers in ProgramData before
+    moving them (correlate with a following install into System32).
+  - legitimately signed driver updaters writing to vendor directories.
+level: high
