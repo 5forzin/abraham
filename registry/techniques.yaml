@@ -727,3 +727,60 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t035.md
         status: experimental
+
+  - id: ABR-T028
+    name: In-process filesystem modules
+    description: >
+      Four filesystem module ops executed on the implant's session
+      thread through std::fs - mkdir (recursive), rm (file or
+      directory tree), mv (rename) and cp (file copy) - so routine
+      file management never spawns a cmd.exe/powershell.exe child
+      (process creation being the noisiest classic C2 artifact).
+      Extends the ABR-T011 module registry; task transport is the
+      existing MODULE task (name + args strings). Detection: no child
+      process or script-block telemetry fires; Sysmon EID 11/23 file
+      events attribute directly to the implant image, and
+      create-then-delete staging patterns in user temp remain the
+      anchor.
+    mitre_attack:
+      - T1083
+      - T1070.004
+    component: implant::modules
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t028.md
+        status: experimental
+
+  - id: ABR-T029
+    name: In-process host and network survey modules
+    description: >
+      Inventory modules resolved on demand through the manual export
+      walker, no CLI children: arp (GetIpNetTable), route
+      (GetIpForwardTable), domain (NetGetJoinInformation +
+      DsGetDcNameW + GetComputerNameExW - join state, DC/forest/site,
+      DNS identity), disks (GetLogicalDriveStringsW +
+      GetDiskFreeSpaceExW + GetVolumeInformationW) and services
+      (EnumServicesStatusExW through the SCM, the ABR-T013 staging
+      pattern - name/state/pid/display). ps gains a best-effort owner
+      column: NtOpenProcessToken on the already-open QUERY_LIMITED
+      handle, NtQueryInformationToken(TokenUser) and
+      LookupAccountSidW. The classic T1016/T1018/T1007 CLI Sigma
+      families stay silent by design; the compensating host signal is
+      SCM enumeration by a non-service process plus the per-PID token
+      query spike.
+    mitre_attack:
+      - T1016
+      - T1018
+      - T1007
+      - T1057
+    component: implant::modules
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t029.md
+        status: experimental

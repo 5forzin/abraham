@@ -85,14 +85,18 @@ failures and resets once a session reaches the beacon loop.
 Routine collection runs IN-PROCESS through built-in modules — no
 `cmd.exe` child, no process-creation telemetry (ABR-T011; see
 `docs/detections/abr-t011.md`). Available: `ps` (pid, ppid, threads,
-handles, name, IMAGE PATH and COMMAND LINE — the detail pass runs a
-per-pid `NtQueryInformationProcess` through the spoofed dispatcher;
-protected processes degrade to `-`), `ls <path>`, `cat <path>` (capped
-at 512 KiB; use download for bigger files), `whoami` (REAL ppid,
-token integrity and `RtlGetVersion` build — the same values REGISTER
-reports), `netstat` (TCP/UDP owner-pid tables via iphlpapi, IPv4) and
-`env`. Submit with `module <id> <name> [args...]` in the TUI or
-`{"cmd":"module","session":N,"name":"ps","args":""}` on the mgmt port.
+handles, name, IMAGE PATH, COMMAND LINE and best-effort OWNER — the
+detail pass runs a per-pid `NtQueryInformationProcess` + token query
+through the spoofed dispatcher; protected processes degrade to `-`),
+`ls <path>`, `cat <path>` (capped at 512 KiB; use download for bigger
+files), `mkdir <path>`, `rm <path>`, `mv <src> <dst>`, `cp <src>
+<dst>` (ABR-T028), `whoami` (REAL ppid, token integrity and
+`RtlGetVersion` build — the same values REGISTER reports), `netstat`
+(TCP/UDP owner-pid tables via iphlpapi, IPv4+IPv6), `arp`, `route`,
+`domain` (join state, DC/forest/site, DNS identity), `disks`,
+`services` (ABR-T029) and `env`. Submit with `module <id> <name>
+[args...]` in the TUI or `{"cmd":"module","session":N,"name":"ps"}`
+on the mgmt port.
 Shell tasks remain available but are the noisy option — prefer modules
 whenever one fits.
 

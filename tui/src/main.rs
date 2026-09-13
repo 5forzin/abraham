@@ -111,7 +111,7 @@ impl App {
                 self.push_log("  sessions                        refresh session list".into());
                 self.push_log("  shell <id> <command...>         run command on session".into());
                 self.push_log(
-                    "  module <id> <name> [args...]     in-process module (ps/ls/cat/whoami/netstat/env)"
+                    "  module <id> <name> [args...]     in-process module (ps ls cat mkdir rm mv cp whoami netstat arp route domain disks services env)"
                         .into(),
                 );
                 self.push_log(
