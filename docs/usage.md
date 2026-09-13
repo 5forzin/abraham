@@ -171,6 +171,22 @@ vectors are documented follow-ups.
   implant code), so coverage equals the beacon cadence: lower the
   sleep before a keylogging window, raise it after.
 
+## Credential access tasks (ABR-T032/T033)
+
+`cred <id> <user|kernel>` dumps LSASS through the custom minidump
+writer (no dbghelp/comsvcs chain) into `%TEMP%\<random>.tmp` — the
+result is the path; fetch it with `download <id> <path>` and parse
+offline:
+
+- `user` (T032) — NtOpenProcess(VM_READ) + NtReadVirtualMemory through
+  the indirect-syscall layer. Sysmon EID 10 fires by design: this
+  variant validates your lsass-access coverage.
+- `kernel` (T033) — requires the staged iqvw64e driver
+  (`driver <id> load ...` first). KeStackAttachProcess via the call
+  trampoline; no lsass handle is ever opened, so EID 10 stays silent —
+  the documented coverage-gap exhibit. The WinIo physical path is
+  blacklisted (0x1A bugchecks) and stays unused.
+
 ## Shellcode tasks (ABR-T022)
 
 `exec <id> <local-file>` queues an in-process shellcode stage: the blob

