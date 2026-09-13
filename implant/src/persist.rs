@@ -423,13 +423,37 @@ fn service_remove(name: &str) -> Result<String, String> {
     // on the next boot at the latest.
     unsafe { control(svc, 1, &mut status) }; // SERVICE_CONTROL_STOP
     let rc = unsafe { delete(svc) };
+    let last_error = if rc == 0 {
+        kernel32_get_last_error()
+    } else {
+        0
+    };
     unsafe { close(svc) };
-    if rc == 0 {
+    if rc == 0 && last_error != 1072 {
+        // 1072 = ERROR_SERVICE_MARKED_FOR_DELETE: the delete already
+        // landed; the entry disappears once the last handle closes.
         return Err(format!(
-            "DeleteService({name}) failed (marked for deletion on boot?)"
+            "DeleteService({name}) failed: last error {last_error}"
         ));
     }
-    Ok(format!("service {name} stopped and deleted"))
+    if rc == 0 {
+        Ok(format!(
+            "service {name} marked for deletion (vanishes when handles close)"
+        ))
+    } else {
+        Ok(format!("service {name} stopped and deleted"))
+    }
+}
+
+/// GetLastError lives in kernel32, not advapi32.
+fn kernel32_get_last_error() -> u32 {
+    match unsafe { syscalls::export_address("kernel32.dll", "GetLastError") } {
+        Some(addr) => {
+            let f: unsafe extern "system" fn() -> u32 = unsafe { std::mem::transmute(addr) };
+            unsafe { f() }
+        }
+        None => 0,
+    }
 }
 
 // --- install/remove/list dispatch ---
