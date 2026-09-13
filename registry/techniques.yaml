@@ -944,3 +944,42 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t034.md
         status: experimental
+
+  - id: ABR-T036
+    name: AMSI/ETW suppression via hardware breakpoints and a vectored handler
+    description: >
+      Patch-free successor of ABR-T024 for the same two instrumentation
+      layers: execution breakpoints (debug registers DR0/DR1, enabled
+      via DR7 L0|L1) are set on amsi.dll!AmsiScanBuffer and
+      ntdll!EtwEventWrite, and the resulting single-step exceptions are
+      retired inside a first-in-chain vectored exception handler that
+      hand-assembled lives on the external code page (ABR-T012 stomped
+      DLL when available, private RW otherwise, unwind metadata per
+      ABR-T008) - the handler sets Rax to the success value, writes
+      AMSI_RESULT_CLEAN through the 6th argument slot and resumes at
+      the function's first ret. Zero bytes of any signed module are
+      modified, so hash-based tamper scanners (pe-sieve hooked/
+      replaced) stay quiet; the artifact that replaces the patch is
+      the debug-register state itself. Arming happens from a helper
+      thread (suspend, SetThreadContext with debug-register flags,
+      readback, resume) so the write is defined, and a readback gate
+      falls back to the ABR-T024 byte patch when the debug registers
+      do not stick. Measured on Windows 11 26200: with a hypervisor
+      owning the debug registers (VBS/Credential Guard running, and
+      HypervisorPresent even with VBS reported off) the write reports
+      success but is silently discarded - the technique is
+      structurally blocked there and the fallback carries coverage.
+      On builds without that, the handler retirement semantics are
+      validated synthetically (EXCEPTION_POINTERS/CONTEXT driven
+      directly) on every host.
+    mitre_attack:
+      - T1562.001
+      - T1562.002
+    component: implant::evasion::hwbp
+    phase: 5
+    status: experimental
+    lab_validated: 2026-09-13
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t036.md
+        status: experimental

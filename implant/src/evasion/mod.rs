@@ -1,6 +1,7 @@
 //! Phase 2 evasion primitives. Each capability maps to a registry technique
 //! (ABR-T005..T012) and ships with its detection counterpart.
 
+pub mod hwbp;
 pub mod patch;
 pub mod sleep;
 pub mod spoof;

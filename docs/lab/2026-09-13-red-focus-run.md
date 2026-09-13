@@ -48,4 +48,55 @@ for everything that follows.
 
 ## Part 2 — T036: AMSI/ETW via hardware breakpoints
 
-(pending)
+Implemented the patch-free successor of T024: DR0/DR1 execution
+breakpoints on `AmsiScanBuffer`/`EtwEventWrite`, retired by a
+hand-assembled VEH handler living on the external code page (stomped
+DLL preferred, unwind metadata registered). `clr.rs` prefers hwbp and
+falls back to the byte patch automatically.
+
+Three bugs the validation caught (all in the hand-assembled handler,
+all invisible to "it compiles"):
+
+1. **ModRM reg field**: `4D 39 1B` decodes `cmp [r11], r11` — the
+   handler compared Rip against the *address of the params block*
+   instead of against r10. Both compares fixed to reg=010 (`0x13`,
+   `0x53`); the layout test now pins those bytes.
+2. **Epilogue order**: the AMSI path falls through into whichever
+   block sits next — `.pass` was first, so every retirement returned
+   CONTINUE_SEARCH after doing all the work. `.done` moved before
+   `.pass`, and the `jmp` rel32 had to be recalculated (a stale 0x46
+   landed mid-instruction and produced a literal SIGILL — the first
+   crash caught by the synthetic test).
+3. **Self SetThreadContext is undefined on a running thread**: arming
+   moved to a helper thread (suspend → SetThreadContext with debug
+   flags → readback → resume) that exists only for the call, keeping
+   the single-thread execution model intact.
+
+**The finding that matters: Windows 11 26200 discards user-mode debug
+register writes whenever a hypervisor owns them.** Measured on two
+environments — the operator host (VBS/Credential Guard running) and
+the lab VM (HypervisorPresent with VBS off) — through four write
+vectors (kernel32 self, full-context, raw NtSetContextThread via the
+indirect-syscall layer, suspend/set/resume helper): every write
+reports success, the readback reads zero, breakpoints never fire.
+`ensure_armed` gates on the readback and falls back to the T024 patch,
+so coverage degrades to the patch's detection surface rather than to
+nothing. For the blue side this is a measured kill-switch: the DR0 IOC
+(`lab/bench/drscan.ps1`) is the tell on non-virtualized hosts; on the
+VBS fleet the technique is structurally dead. All of it documented in
+`docs/detections/abr-t036.md`.
+
+The handler itself is validated everywhere by
+`handler_retires_synthetic_contexts`: it drives the assembled bytes
+with a synthetic EXCEPTION_POINTERS/CONTEXT — the exact kernel
+delivery state for a DR single-step — and asserts the ETW retirement,
+the AMSI retirement (including AMSI_RESULT_CLEAN through
+`[Rsp+0x28]`) and the pass-through. That test is what exposed bugs 1
+and 2; the DR-gated integration tests only run where debug registers
+stick.
+
+Also this phase: the `clipboard_returns_something` test became a
+diagnostic (the lab host's clipboard is chronically held open —
+observed failing for every process including standalone PowerShell;
+VMware clipboard arbitration with a running guest is the prime
+suspect).
