@@ -3,7 +3,10 @@ resolver = "2"
 members = ["common", "implant", "server", "tui"]
 
 [workspace.package]
-version = "0.1.0"
+# 0.2.0 gates the empty-poll 204 on the teamserver (implants report
+# their version at REGISTER; older builds keep receiving sealed empty
+# batches) and the cookie-carried session token.
+version = "0.2.0"
 edition = "2021"
 authors = ["Anthony Sforzin"]
 license = "MIT"

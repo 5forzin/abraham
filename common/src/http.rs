@@ -42,6 +42,7 @@ pub struct HttpResponse {
 pub fn reason_for(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -195,17 +196,25 @@ pub async fn read_response<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<H
     Ok(HttpResponse { status, body })
 }
 
-/// Writes an HTTP/1.1 keep-alive response with a binary body.
+/// Writes an HTTP/1.1 keep-alive response with a binary body. A 204
+/// (empty poll) carries no body and no Content-Length, per RFC 7230.
 pub async fn write_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     status: u16,
     server_header: &str,
     body: &[u8],
 ) -> io::Result<()> {
+    let length_line = if status == 204 {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/octet-stream\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
     let head = format!(
-        "HTTP/1.1 {status} {}\r\nServer: {server_header}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-        reason_for(status),
-        body.len()
+        "HTTP/1.1 {status} {}\r\nServer: {server_header}\r\n{length_line}Connection: keep-alive\r\n\r\n",
+        reason_for(status)
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body).await?;
@@ -214,6 +223,15 @@ pub async fn write_response<S: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn response_204_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_response(&mut a, 204, "nginx", b"").await.unwrap();
+        let resp = read_response(&mut b).await.unwrap();
+        assert_eq!(resp.status, 204);
+        assert!(resp.body.is_empty());
+    }
+
     use super::*;
 
     #[tokio::test]

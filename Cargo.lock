@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abraham-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "abraham-implant"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "abraham-common",
  "anyhow",
@@ -29,6 +29,7 @@ dependencies = [
  "hex",
  "native-tls",
  "rand",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
@@ -37,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "abraham-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "abraham-common",
  "anyhow",
@@ -56,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "abraham-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ratatui",

@@ -1,7 +1,12 @@
 {
- "server": "avln.nora.systems:443",
- "key": "acd94f64d078e1cde63dcb422f3d17bf16aa5f06243860c43ad1e0208f8c14d5",
- "tls_pin": "",
- "evasion": "",
- "profile": "sleep_secs: 10\njitter: 0.3\n"
+  "servers": ["avln.nora.systems:443"],
+  "key": "acd94f64d078e1cde63dcb422f3d17bf16aa5f06243860c43ad1e0208f8c14d5",
+  "tls_pin": "",
+  "evasion": "",
+  "profile": "sleep_secs: 10\njitter: 0.3\n",
+  "kill_date": 1797036250,
+  "gates": {
+    "initial_delay_max_secs": 0,
+    "blocked_processes": []
+  }
 }

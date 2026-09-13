@@ -684,3 +684,46 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t027.md
         status: experimental
+
+  - id: ABR-T035
+    name: Malleable transport hardening - cookie demux, idle 204s, kill date, gates and front failover
+    description: >
+      Five transport-era tradecraft improvements shipped together
+      (implant 0.2.0). (1) The session demux token moves from the
+      X-Session header into a profile-named session cookie
+      (Cookie: sid=<u64>, name from the malleable profile) - a session
+      cookie is what web-fronted traffic normally carries, a custom
+      header is not; the header remains accepted for pre-0.2.0 builds.
+      (2) Idle TASK_POLLs answer HTTP 204 with no body - no sealed
+      BATCH_END blob, so an idle beacon stops emitting a constant
+      small binary POST/200 pair; gated on the implant build version
+      reported at REGISTER so legacy builds keep the old envelope.
+      (3) kill_date in the embedded config: past the unix timestamp
+      the implant exits silently - dead tooling must not keep
+      beaconing (SUNBURST-style expiry, also lab hygiene). (4)
+      Environment gates: a random activation delay before first
+      contact breaks the process-start to immediate-beacon
+      correlation, and a blocked-process list keeps the implant
+      dormant (name-only NtQuerySystemInformation polls through the
+      indirect-syscall layer, no contact) on analyst/EDR workstations.
+      (5) servers[] front failover: after 3 consecutive transport
+      failures the implant rotates to the next configured front with
+      the same session token, resuming into the same teamserver
+      session. The embedded config itself becomes one encrypted JSON
+      blob (schema in protocol.md 8.1) instead of five fixed string
+      fields. Detection: numeric-only cookie values constant across
+      requests, near-monotone POST->204 cadence, cross-front rotation
+      joined by the cookie value, and the dormancy polling pattern
+      (process enumeration without children or sockets).
+    mitre_attack:
+      - T1071.001
+      - T1497.001
+      - T1497.003
+    component: implant::main
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t035.md
+        status: experimental

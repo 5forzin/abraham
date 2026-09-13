@@ -18,9 +18,14 @@ fn default_server_header() -> String {
     "nginx".to_string()
 }
 
+fn default_cookie_name() -> String {
+    "sid".to_string()
+}
+
 /// Malleable transport profile shared by the teamserver listener and the
 /// implant. Controls the outer HTTP envelope (URIs, User-Agent, Server
-/// header) served inside TLS, plus default beacon timing.
+/// header, session-cookie name) served inside TLS, plus default beacon
+/// timing.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
     #[serde(default = "default_uris")]
@@ -29,6 +34,11 @@ pub struct Profile {
     pub user_agent: String,
     #[serde(default = "default_server_header")]
     pub server_header: String,
+    /// Cookie the session token rides in instead of the X-Session
+    /// header: web-fronted traffic with a session cookie is the norm,
+    /// a custom header is not (T035).
+    #[serde(default = "default_cookie_name")]
+    pub cookie_name: String,
     #[serde(default = "default_sleep_secs")]
     pub sleep_secs: u64,
     #[serde(default = "default_jitter")]
@@ -41,6 +51,7 @@ impl Default for Profile {
             uris: default_uris(),
             user_agent: default_user_agent(),
             server_header: default_server_header(),
+            cookie_name: default_cookie_name(),
             sleep_secs: default_sleep_secs(),
             jitter: default_jitter(),
         }
@@ -94,11 +105,12 @@ mod tests {
 
     #[test]
     fn full_parse() {
-        let text = "uris: [/a, /b]\nuser_agent: test-agent\nserver_header: iis\nsleep_secs: 3\njitter: 0.5\n";
+        let text = "uris: [/a, /b]\nuser_agent: test-agent\nserver_header: iis\ncookie_name: session\nsleep_secs: 3\njitter: 0.5\n";
         let profile = Profile::load(text).unwrap();
         assert_eq!(profile.uris.len(), 2);
         assert_eq!(profile.user_agent, "test-agent");
         assert_eq!(profile.server_header, "iis");
+        assert_eq!(profile.cookie_name, "session");
         assert_eq!(profile.sleep_secs, 3);
         assert_eq!(profile.jitter, 0.5);
         let picked = profile.pick_uri();

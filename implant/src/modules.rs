@@ -122,6 +122,82 @@ fn parse_processes(buffer: &[u8]) -> Vec<String> {
     rows
 }
 
+/// True when any named process is running (case-insensitive, name only
+/// — no per-process queries). The environment gate (T035) polls this
+/// before first contact and while dormant.
+pub fn any_process_running(names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let Some(query) = (unsafe { syscalls::resolve("NtQuerySystemInformation") }) else {
+        return false;
+    };
+    let mut buffer = vec![0u8; 0x8000];
+    loop {
+        let mut needed = 0usize;
+        let status = unsafe {
+            syscalls::dispatch6(
+                query,
+                SYSTEM_PROCESS_INFORMATION,
+                buffer.as_mut_ptr() as usize,
+                buffer.len(),
+                &mut needed as *mut usize as usize,
+                0,
+                0,
+            )
+        };
+        let nt = status as u32 as i32;
+        if nt < 0 && nt as u32 == STATUS_INFO_LENGTH_MISMATCH {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if nt < 0 {
+            return false;
+        }
+        break;
+    }
+    // Walk the same SYSTEM_PROCESS_INFORMATION chain as `ps`, comparing
+    // image names only.
+    let read_u16 = |off: usize| -> Option<u16> {
+        buffer
+            .get(off..off + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        buffer
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let read_usize = |off: usize| -> Option<usize> {
+        buffer.get(off..off + 8).map(|b| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(b);
+            usize::from_le_bytes(bytes)
+        })
+    };
+    let mut offset = 0usize;
+    while let Some(next) = read_u32(offset) {
+        let name_len = read_u16(offset + 0x38).unwrap_or(0) as usize;
+        let name_ptr = read_usize(offset + 0x40).unwrap_or(0);
+        let name = if name_len > 0 && name_ptr != 0 {
+            read_utf16z(name_ptr, name_len)
+        } else {
+            "System".to_string()
+        };
+        if names
+            .iter()
+            .any(|want| want.trim().eq_ignore_ascii_case(&name))
+        {
+            return true;
+        }
+        if next == 0 {
+            break;
+        }
+        offset += next as usize;
+    }
+    false
+}
+
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 struct ClientId {

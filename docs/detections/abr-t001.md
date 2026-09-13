@@ -59,16 +59,21 @@ monitors by design — detection focuses on the outer flow.
    EID 3 for the same PID: a non-browser, non-service process with a
    steady Schannel session cadence to one destination is the residual
    host-side signal once the wire looks native.
-7. **Demux header correlation (network side, 2026-09-12)**: every
-   protocol POST carries `X-Session: <token>` in the clear at the
-   outer-TLS layer (protocol.md §5.1). Any middlebox that terminates
-   TLS — the CDN edge always does; enterprise SSL-inspection proxies
-   would — sees a stable per-implant-process token that joins the
-   beacon's requests across connection churn and IP rotation. Alert on
-   a recurring custom header whose value is a decimal u64 on
-   keep-alive POST flows from one source; the token is also an
-   IOC-grade pivot (it appears verbatim in the teamserver's
-   `state/sessions.json` when seized).
+7. **Demux tag correlation (network side, 2026-09-12; updated for the
+   cookie era 2026-09-12/T035)**: every protocol POST carries the
+   session token in the clear at the outer-TLS layer (protocol.md
+   §5.1). Any middlebox that terminates TLS — the CDN edge always does;
+   enterprise SSL-inspection proxies would — sees a stable
+   per-implant-process token that joins the beacon's requests across
+   connection churn and IP rotation. Until 0.1.x this rode in the
+   `X-Session` header (recurring custom header with a decimal u64
+   value); since 0.2.0 it rides in the profile-named session cookie
+   (`Cookie: sid=<token>` by default). The alert shape moves to:
+   a session cookie whose value is a bare decimal number (real web
+   session ids are not), constant across requests, on keep-alive POST
+   flows from one source that answer mostly `204`. The token is still
+   an IOC-grade pivot — it appears verbatim in the teamserver's
+   `state/sessions.json` when seized.
 
 ## Lab validation (2026-09-10, outer HTTPS)
 

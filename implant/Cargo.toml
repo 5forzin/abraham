@@ -28,6 +28,10 @@ hex = "0.4"
 # against the peer certificate before any protocol bytes are sent.
 native-tls = "0.2"
 rand = "0.8"
+# serde/serde_json: runtime parsing of the embedded configuration blob
+# (single-blob embed since T035; build.rs still owns validation).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros"] }
 tokio-native-tls = "0.3"
