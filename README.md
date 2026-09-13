@@ -1,134 +1,138 @@
 # Abraham
 
-### *A Critique of Pure Kernel Reason*
+**A command-and-control framework that refuses to ship an offensive technique without its detection.**
 
 [![CI](https://github.com/5forzin/abraham/actions/workflows/ci.yml/badge.svg)](https://github.com/5forzin/abraham/actions/workflows/ci.yml)
 
-> I have been asked — not infrequently, and invariably by persons ill-prepared
-> to profit from the answer — why one would construct such a system at all. I
-> reply that reason has this peculiar fate: it is burdened with questions
-> which it cannot dismiss, because they are posed by the very architecture it
-> interrogates, but which it also cannot answer until it has interrogated its
-> own privilege. This work performs that interrogation. On a machine. In
-> kernel space. Where, as I alone have had the patience to demonstrate,
-> nobody is watching the watchmen.
+## What this is
 
----
+Abraham is a purple-team C2 research framework for Windows. Implant,
+teamserver, TUI, a kernel demonstrator, an operator web view — and, riding
+along with every single offensive technique, the artifact that catches it:
+a Sigma rule or a detection-guidance document, validated against live
+telemetry on an instrumented lab VM before the technique is allowed into
+the registry. Thirty-six techniques are in there right now, from indirect
+syscalls with stack spoofing to LSASS dumps taken from kernel address
+space. The registry validator enforces the pairing in CI, so a technique
+without a detection doesn't get merged, doesn't get built, doesn't get to
+pretend.
 
-## Prolegomena to Any Future Kernel Metaphysics
+That's the whole idea. Everything else is implementation.
 
-Abraham is a research framework in which the power to subvert a Windows
-system and the power to detect that subversion are not two projects, nor
-even two faculties of one project, but **one and the same act of
-legislation**. Every technique in this repository — all twenty-one, each
-validated in a live laboratory and not one merely reasoned about at a desk —
-is admitted only together with its counter-sign: a Sigma rule, a guidance,
-an exhibit, filed under `detections/` and `registry/techniques.yaml`. The
-offensive and the defensive are given as a synthetic unity a priori. Those
-who ship one without the other have not yet attained the standpoint of
-science, whatever their stars may flatter them into believing.
+## The house rule
 
-## The Categorical Imperative of Detection
+No detection, no merge. Not "detection later", not "detection in the next
+sprint". Same commit, same author, same blame line. It has a surprisingly
+calming effect on how you design things — when you know the rule for
+catching your trick has to sit next to the trick, you start writing
+different tricks.
 
-> *Act only according to that maxim of subversion which you can at the same
-> time will to be detectable as a universal law.*
-
-This is not ethics grafted onto engineering; it is the condition of
-possibility of the engineering itself. A capability whose detection I could
-not will is a capability about which I could know nothing — and I do not
-traffic in things I cannot know. Hence each registry entry cites its
-evidence (`lab/captures/`), its MITRE form, and the exact event identifiers
-by which it shall be judged. The reader will forgive my thoroughness; it is
-the only luxury I permit myself.
-
-## The Circle of Understanding
-
-Every capability traverses the same circle — none enters the archive by a
-shortcut:
+The loop every capability goes through, no shortcuts:
 
 ```
-   capability is conceived
-              |
-              v
-   technique entry ABR-T0xx   (registry/techniques.yaml)
-        |               |
-        v               v
- implementation     detection (Sigma / guidance)
-        |               |
-        +-------+-------+
-                v
-      judged in the laboratory:
-      telemetry captured, rule fired,
-      exhibit archived (lab/captures/)
-                |
-                v
-        admitted — or annihilated
+   idea
+    |
+    v
+ registry entry (ABR-T0xx)  -->  detection artifact (Sigma / guidance)
+    |                                      |
+    v                                      v
+ implementation                        written honestly
+ (what it does NOT trigger, included)
+    |                                      |
+    +----------------+--------------------+
+                     v
+           judged in the lab:
+     telemetry captured, rule fired,
+       evidence archived under lab/
+                     |
+                     v
+           merged -- or thrown out
 ```
 
-## Transcendental Analytic: the Faculties
+The "what it does NOT trigger" part matters as much as the rest. A
+detection doc that only lists wins is marketing.
 
-| Faculty | Path | Function in the system of reason |
-|---|---|---|
-| The Schema | `common/` | The categories (protocol, framing) under which all experience herein is possible |
-| The Executive Faculty | `implant/` | Acts in a territory not its own; `mapper.rs` is its most audacious moment |
-| The Unity of Apperception | `server/`, `tui/` | The "I think" that must accompany every session |
-| The Thing-in-Itself | `payloads/abraham-km/` | Freestanding Rust, zero imports, given its kernel functions by an act of the mapper — a modest proof that the noumenon can be mapped |
-| The Tribunal | `detections/`, `tools/` | Where every claim above is cross-examined |
-| The Archive of Experience | `docs/`, `lab/` | Thirteen parts of experimental record, failures included — for I conceal nothing so reliably as I conceal nothing |
+## The map
 
-## The Antinomies of Pure Evasion
+| Path | What lives there |
+|---|---|
+| `common/` | The protocol, framing and crypto both sides agree on. Boring on purpose. |
+| `implant/` | The part that lives in someone else's process. Syscalls resolved by walking exports, sleep obfuscation that encrypts the live stack too, a hand-assembled VEH handler, a COFF loader. `mapper.rs` is the deep end. |
+| `server/`, `tui/` | Teamserver and operator console. Sessions, task queue, audit trail, mgmt auth. |
+| `web/` | Three.js operator view — read-only session telemetry, no tasking route. Loopback only; the management token never leaves the gateway process. |
+| `payloads/abraham-km/` | Freestanding Rust, zero imports, no std — kernel functions are handed to it at runtime by the mapper. About 30KB and does nothing but keep time. |
+| `detections/`, `tools/` | Where every claim gets cross-examined. Sigma rules, the registry validator, the evasion bench. |
+| `docs/`, `lab/` | The lab journals. Failures included — especially the failures. |
 
-Reason falls into antinomy when it extends principles beyond experience. I
-have collected the genuine ones and settled them empirically
-(`docs/lab/2026-09-11-byovd-phase3.md`, Parts 4–13):
+## Field notes
 
-1. **First Antinomy (of Process Concealment).**
-   *Thesis:* a process unlinked from the kernel's object lists cannot be
-   enumerated. *Antithesis:* on build 26200, `SystemProcessInformation`
-   does not enumerate through those lists at all. — Resolution: the
-   technique stands against list-walkers; the framework now refuses,
-   fail-closed and with full diagnostics, to pretend otherwise. Lesser
-   minds would have shipped the bug as a feature.
+Things the lab taught us the hard way, kept here so nobody has to relearn
+them:
 
-2. **Second Antinomy (of the Loader).**
-   *Thesis:* a revoked certificate must forbid the driver. *Antithesis:* on
-   an offline host revocation fails open, and only the blocklist avails. —
-   Hence this family of detections anchors on the one irreducible event:
-   the installation itself.
+1. **DKOM process hiding has a build number.** On 26200,
+   `SystemProcessInformation` doesn't walk the lists everyone's
+   hide-technique unlinks from. The unlink still defeats classic
+   list-walkers, but "invisible" it is not. The framework fails closed and
+   says so instead of shipping the demo-friendly version of the truth.
+   (`docs/lab/2026-09-11-byovd-phase3.md`)
 
-3. **Third Antinomy (of Self-Protection).**
-   *Thesis:* what usermode grants, usermode may revoke. *Antithesis:* a
-   resident payload re-applying its protection on a two-second timer
-   survives the revocation — as two of my own deployments learned, to their
-   cost, before I deigned to intervene.
+2. **A revoked certificate is a vibe, not a wall.** On an offline host,
+   revocation checks fail open. The vulnerable-driver blocklist is the
+   last line, which is why the detections in this family anchor on the one
+   event that can't be lied about: the driver install itself.
 
-## Practical Reason: Building
+3. **What usermode grants, usermode revokes.** A protected process that
+   gets its shield stripped stays stripped — unless something resident
+   reapplies it every two seconds. Two lab deployments died proving the
+   first half of that sentence before the timer came along.
+
+4. **VBS quietly kills hardware-breakpoint hooking.** On Windows 11 with a
+   hypervisor owning the debug registers, `SetThreadContext` writes to
+   DR0 report success and then vanish. Four write vectors, two
+   environments, same result (`docs/detections/abr-t036.md`). The technique
+   stays in the tree, opt-in, with the kill-switch documented.
+
+## The bench
+
+`lab/bench/` runs the implant through a fixed workload under six sensors —
+Sysmon, ETW, Defender, a per-thread debug-register probe, pe-sieve and
+Velociraptor — and commits the scorecards. Baseline first, then after
+every evasion change. It looks like overkill until the day it catches a
+regression that every unit test, every isolated test and both build
+profiles missed: the day the CLR refused to start on any thread that had
+touched debug registers, and only the full implant on the real VM knew.
+That day is written up in the journal like it deserves.
+
+If you take one piece of this repo to copy, take the bench. Measure
+before, measure after, commit both numbers.
+
+## Building it
 
 ```console
 $ cargo build --release
 $ cargo test --workspace
 $ python tools/validate_registry.py
-$ ./tools/build_payload.sh       # the thing-in-itself; no WDK required
-$ python tools/vm_mgmt.py        # operator console, against your own laboratory
+$ ./tools/build_payload.sh       # the kernel demonstrator; no WDK required
+$ python tools/vm_mgmt.py        # operator console, against your own lab
 ```
 
-All checks are expected green. If they are not, the defect is in your
-environment, not in the system — though I concede, as a matter of pure
-courtesy, that one might verify.
+All of it green, every commit. The lab journals under `docs/lab/` walk
+through the full validation passes, captures included.
 
-## Kingdom of Ends
+## License, and what this is not
 
-MIT-licensed. Use it as an end — the hardening of the very systems it
-interrogates — never merely as a means. That is not sentiment; it is the
-imperative again, and it is universal.
+MIT.
+
+It is not a weapon, and it contains none. The only driver binary in this
+tree is the ~30KB demonstrator above, whose entire personality is keeping
+time and insisting on being left alone. No vulnerable drivers live here,
+no exploits, no stolen anything. The dangerous artifacts some techniques
+reference are supplied by the operator, inside their own laboratory,
+under their own rules — which is also the only place this framework is
+meant to run.
 
 ---
 
-*It remains to be said what this repository is not: it is not a weapon, and
-it contains none — no driver binaries but its own thirty-kilobyte
-demonstrator, which does nothing but keep time and insist, gently, on being
-left alone. The dangerous artifacts are supplied by the operator, within
-their own laboratory, under their own law. As, indeed, must we all.*
-
-*— the author, who has merely done for the kernel what the kernel lacked
-the candor to do for itself.*
+*Everything here was tested on machines I own, against sensors I
+configured, and written down even when it made the author look careless.
+That's the whole trick.*
