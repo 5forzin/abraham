@@ -4,6 +4,11 @@ The teamserver mgmt port (9200) speaks newline-delimited JSON over raw
 TCP — not HTTP — and RunShellScript executes via dash (no /dev/tcp), so
 the request travels base64-encoded through python3 on the VM.
 
+When the teamserver runs with --mgmt-token, the token is read from the
+file the deploy wrote (/opt/avln/mgmt.token, overridable with
+ABRAHAM_MGMT_TOKEN_FILE) and sent as the required {"auth": ...} first
+line.
+
 Usage:
     python mgmt.py '{"cmd":"sessions"}'
     python mgmt.py '{"cmd":"results","session":1,"limit":5}'
@@ -20,21 +25,17 @@ RG, VM = "rg-avln", "vm-avln"
 # az.cmd misbehaves under subprocess on Windows; the CLI's own python works.
 AZ = [r"C:\Program Files\Microsoft SDKs\Azure\CLI2\python.exe", "-m", "azure.cli"]
 
-PY_ONE = (
-    "import socket,base64,sys;"
-    "s=socket.create_connection(('127.0.0.1',9200),3);"
-    "s.sendall(base64.b64decode(sys.argv[1])+b'\\n');"
-    "s.settimeout(5);"
-    "print(s.recv(65536).decode().strip())"
-)
-
+TOKEN_FILE = os.environ.get("ABRAHAM_MGMT_TOKEN_FILE", "/opt/avln/mgmt.token")
 
 def mgmt(request):
-    payload = base64.b64encode(json.dumps(request).encode()).decode()
+    return _mgmt_two_stage(request)
+
+
+def _vm_script(script: str) -> str:
     with tempfile.NamedTemporaryFile(
         "w", suffix=".sh", delete=False, newline="\n"
     ) as handle:
-        handle.write(f'python3 -c "{PY_ONE}" "{payload}"\n')
+        handle.write(script)
         path = handle.name
     try:
         result = subprocess.run(
@@ -64,11 +65,47 @@ def mgmt(request):
         os.unlink(path)
     if result.returncode != 0:
         raise RuntimeError(f"az failed: {(result.stderr or '')[:300]}")
-    # The message carries "[stdout]\n...\n[stderr]\n" with real newlines.
     message = result.stdout or ""
     if "[stdout]" not in message:
         raise RuntimeError(f"unexpected run-command output: {message[:300]}")
     return message[message.find("[stdout]") + 9 : message.find("[stderr]")].strip()
+
+
+def _mgmt_two_stage(request):
+    # Stage 1: fetch the auth line (empty when no token file exists, so
+    # the same script works against open and gated teamserver ports).
+    # Stage 2: send [auth?, request] and print the last response line —
+    # reading until a 1s quiet gap so the ack and the reply both land.
+    fetch = (
+        "if [ -f " + TOKEN_FILE + " ]; then python3 -c \"import base64,json;"
+        "print(base64.b64encode(json.dumps({'auth':open('" + TOKEN_FILE
+        + "').read().strip()}).encode()).decode())\"; fi"
+    )
+    auth_b64 = _vm_script(fetch)
+    request_b64 = base64.b64encode(json.dumps(request).encode()).decode()
+
+    sender = (
+        "import socket,base64,sys\n"
+        "s=socket.create_connection(('127.0.0.1',9200),3)\n"
+        "lines=[base64.b64decode(a) for a in sys.argv[1:] if a]\n"
+        "s.sendall(b'\\n'.join(lines)+b'\\n')\n"
+        "s.settimeout(1)\n"
+        "out=[]\n"
+        "while True:\n"
+        "    try:\n"
+        "        d=s.recv(65536)\n"
+        "        if not d: break\n"
+        "        out.append(d)\n"
+        "    except socket.timeout: break\n"
+        "reply=b''.join(out).decode().strip()\n"
+        "print(reply.splitlines()[-1] if reply else '')\n"
+    )
+    sender_b64 = base64.b64encode(sender.encode()).decode()
+    send = (
+        f"python3 -c \"import base64;exec(base64.b64decode('{sender_b64}'))\" "
+        f"\"{auth_b64}\" \"{request_b64}\""
+    )
+    return _vm_script(send)
 
 
 if __name__ == "__main__":

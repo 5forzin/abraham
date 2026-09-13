@@ -26,15 +26,27 @@ impl App {
         let stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let writer = stream.try_clone()?;
-        let reader = BufReader::new(stream);
-        Ok(App {
-            writer,
-            reader,
+        let mut app = App {
+            writer: stream.try_clone()?,
+            reader: BufReader::new(stream),
             sessions: Vec::new(),
             log: vec![Line::from("abraham tui — type 'help' for commands")],
             input: String::new(),
-        })
+        };
+        // Shared-secret mgmt gate: when the teamserver runs with
+        // --mgmt-token, open with {"auth": ...} before anything else.
+        if let Some(token) = mgmt_token() {
+            let reply = app.request(json!({ "auth": token }));
+            if reply
+                .as_ref()
+                .and_then(|v| v.get("error"))
+                .and_then(|e| e.as_str())
+                .is_some_and(|e| e == "unauthorized")
+            {
+                anyhow::bail!("mgmt rejected the token (ABRAHAM_MGMT_TOKEN)");
+            }
+        }
+        Ok(app)
     }
 
     fn push_log(&mut self, line: String) {
@@ -74,8 +86,13 @@ impl App {
                         .and_then(|v| v.as_str())
                         .unwrap_or("?");
                     let addr = entry.get("addr").and_then(|v| v.as_str()).unwrap_or("?");
+                    let stale = entry
+                        .get("stale")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let suffix = if stale { "  [stale]" } else { "" };
                     self.sessions
-                        .push((id, format!("{id}  {user}@{host}  {addr}")));
+                        .push((id, format!("{id}  {user}@{host}  {addr}{suffix}")));
                 }
             }
         }
@@ -365,6 +382,17 @@ fn ui(terminal_frame: &mut ratatui::Frame, app: &App) {
         Paragraph::new(input).block(Block::new().borders(Borders::ALL).title("input")),
         chunks[2],
     );
+}
+
+/// Mgmt shared secret: argv[2] or ABRAHAM_MGMT_TOKEN; None means the
+/// teamserver mgmt port is open (lab/dev default).
+fn mgmt_token() -> Option<String> {
+    if let Some(token) = std::env::args().nth(2) {
+        return (!token.is_empty()).then_some(token);
+    }
+    std::env::var("ABRAHAM_MGMT_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
 }
 
 fn main() -> Result<()> {

@@ -211,12 +211,18 @@ ship with detection guidance in `docs/detections/`.
 ### TUI
 
 ```
-target\release\abraham-tui.exe [mgmt addr]
+target\release\abraham-tui.exe [mgmt addr] [mgmt token]
 ```
 
-Commands: `sessions`, `shell <id> <command...>`, `upload <id> <local>
+The token may also come from `ABRAHAM_MGMT_TOKEN`; it is only needed
+when the teamserver runs with `--mgmt-token`. Commands: `sessions`,
+`shell <id> <command...>`, `module <id> <name> [args...]` (in-process:
+ps/ls/cat/whoami/netstat/env), `exec <id> <shellcode file>`, `execasm`,
+`psrun`, `runpe`, `driver <id> <action>`, `upload <id> <local>
 <remote>`, `download <id> <path>`, `sleep <id> <secs> <jitter>`,
-`results <id> [limit]`, `exit <id>`. `Esc` quits.
+`results <id> [limit]`, `exit <id>`. `Esc` quits. Sessions the
+teamserver considers stale (last seen > 10x profile sleep) render with
+a `[stale]` marker.
 
 ### Scripting (JSON lines on the mgmt port)
 
@@ -225,7 +231,22 @@ python tools\mgmt_client.py '{\"cmd\":\"sessions\"}' 9000
 python tools\mgmt_client.py '{\"cmd\":\"shell\",\"session\":1,\"command\":\"whoami\"}' 9000
 ```
 
+With `--mgmt-token <secret>` the first line of every mgmt connection
+must be `{"auth":"<secret>"}`; the server acks `{"ok":true}` before
+accepting commands and audits refusals.
+
 Downloads land in `loot/session-<id>/task-<n>.bin`.
+
+### Server-side operational record
+
+- `state/sessions.json` — session registry AND undelivered task queue;
+  a restart re-enqueues tasks that had not been polled yet
+  (`--state ""` disables persistence).
+- `state/audit.jsonl` (`--audit`, empty value disables) — JSON lines of
+  `session_new`, `session_resume`, `task_queued`, `task_delivered`,
+  `task_result`, `download_loot`, `mgmt_denied`. This is the
+  after-action source: map task delivery timestamps against detection
+  telemetry when writing validation reports.
 
 ## 4. Run the test suite
 

