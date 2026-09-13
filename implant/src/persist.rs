@@ -411,7 +411,10 @@ fn service_remove(name: &str) -> Result<String, String> {
         return Err("OpenSCManagerW failed (elevation required)".into());
     }
     let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let svc = unsafe { open_svc(scm, wide_name.as_ptr(), 0x0010 | 0x0020) }; // STOP | DELETE
+    // DELETE is the STANDARD object right 0x10000 (0x0010/0x0020 are
+    // START/STOP — easy to confuse; a handle without DELETE makes
+    // DeleteService fail with ACCESS_DENIED).
+    let svc = unsafe { open_svc(scm, wide_name.as_ptr(), 0x0020 | 0x0001_0000) }; // STOP | DELETE
     unsafe { close(scm) };
     if svc == 0 {
         return Err(format!(
