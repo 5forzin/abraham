@@ -93,8 +93,32 @@ fi
 
 say "restarting avln-server"
 out=$(run_vm restart <<'EOS'
+# Mgmt token: generate once, keep stable across deploys. systemd does
+# not expand $(...) in ExecStart — the token rides via EnvironmentFile.
+if [ ! -s /opt/avln/mgmt.token ]; then
+  head -c 32 /dev/urandom | base64 | tr -d '=+/' > /opt/avln/mgmt.token
+fi
+chmod 600 /opt/avln/mgmt.token
+printf 'MGMT_TOKEN=%s\n' "$(cat /opt/avln/mgmt.token)" > /opt/avln/mgmt.env
+chmod 600 /opt/avln/mgmt.env
+cat > /etc/systemd/system/avln-server.service <<UNIT
+[Unit]
+Description=Abraham teamserver (avln)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/avln/run
+EnvironmentFile=/opt/avln/mgmt.env
+ExecStart=/opt/avln/target/release/abraham-server --listen 0.0.0.0:443 --mgmt 127.0.0.1:9200 --mgmt-token \${MGMT_TOKEN} --tls-cert /etc/letsencrypt/live/avln.nora.systems/fullchain.pem --tls-key /etc/letsencrypt/live/avln.nora.systems/privkey.pem --profile /opt/avln/profiles/default.yaml --stage-file /opt/avln/run/stage.bin
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
 systemctl restart avln-server && sleep 2 && systemctl is-active avln-server
-journalctl -u avln-server -n 4 --no-pager
+journalctl -u avln-server -n 6 --no-pager
 EOS
 ) || exit 1
   echo "$out"
