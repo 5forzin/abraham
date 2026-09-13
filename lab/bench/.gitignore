@@ -1,0 +1,11 @@
+# Sensor binaries fetched per-host (see README.md for pinned versions).
+tools/*.exe
+tools/*.txt
+tools/vr-test.ps1
+tools/etw-test.ps1
+tools/pe-test.ps1
+tools/guest-check.ps1
+
+# Raw captures (zips pulled from the guest) stay out of the repo; the
+# distilled evidence lives in scorecard-*.md and the journal.
+results/
