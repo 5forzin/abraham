@@ -1640,18 +1640,30 @@ async fn list_sessions(state: &Arc<AppState>) -> Value {
             let info = h.info.lock().unwrap();
             let last_seen = h.last_seen.load(Ordering::SeqCst);
             let age = now().saturating_sub(last_seen);
+            let pending_tasks = h
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| matches!(message, Message::Task(_)))
+                .count();
             json!({
                 "id": id,
+                "username": info.username.as_str(),
+                "domain": info.domain.as_str(),
                 "user": format!("{}\\{}", info.domain, info.username),
                 "hostname": info.hostname.as_str(),
                 "pid": info.pid,
+                "ppid": info.ppid,
                 "arch": if info.arch == message::ARCH_X64 { "x64" } else { "arm64" },
                 "integrity_level": info.integrity_level,
+                "os_build": info.os_build.as_str(),
                 "addr": h.addr.lock().unwrap().as_str(),
                 "last_seen": last_seen,
                 "age": age,
                 "stale": age > state.stale_after_secs,
                 "implant_version": info.implant_version.as_str(),
+                "pending_tasks": pending_tasks,
             })
         })
         .collect();

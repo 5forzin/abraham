@@ -310,6 +310,18 @@ accepting commands and audits refusals.
 
 Downloads land in `loot/session-<id>/task-<n>.bin`.
 
+### Operator web UI
+
+The additive Three.js operator interface lives in `web/`. Configure
+`web/.env.local` from `web/.env.example`, run `npm start` in that directory,
+and open `http://127.0.0.1:4173`. The Node gateway translates only the
+read-only `sessions` and `results` management commands and gives those
+snapshots to the OpenAI assistant. It deliberately has no generic tasking
+route; operational commands remain available through the TUI.
+
+The web server is loopback-only. Use an authenticated tunnel or run it beside
+the teamserver for a remote deployment; never publish the raw management port.
+
 ### Server-side operational record
 
 - `state/sessions.json` — session registry AND undelivered task queue;

@@ -1,0 +1,18 @@
+{
+  "name": "abraham",
+  "version": "1.0.0",
+  "description": "Abraham operator UI and read-only AI gateway",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server.cjs",
+    "check": "node --check server.cjs && node --check dist/app.js && node --check dist/scene.js && node --check dist/building.js && node --check dist/building-view.js && node --check dist/floor-plan.js && node --check dist/data.js && node --check dist/layout.js && node --check dist/workspace-ui.js && node --check dist/windows.js && node --check dist/mesh-batching.js && node --check dist/palms.js && node --check dist/streetscape.js",
+    "test": "node --test server.test.cjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "three": "^0.186.0"
+  }
+}

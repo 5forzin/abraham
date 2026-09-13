@@ -28,3 +28,7 @@ cache/
 
 # Deploy scratch (built stage binaries)
 deploy/avln/.build/
+
+# Operator web UI
+web/node_modules/
+web/.env.local
