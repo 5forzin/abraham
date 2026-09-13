@@ -495,3 +495,192 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t021.md
         status: experimental
+
+  - id: ABR-T022
+    name: In-process shellcode execution without a child process or thread
+    description: >
+      The EXEC task (task_type 0x08) runs position-independent
+      operator payloads inside the implant: RW allocation via
+      NtAllocateVirtualMemory (indirect syscalls, spoofed stack),
+      volatile copy, NtProtectVirtualMemory flip to RX, a direct call
+      as fn(usize) -> usize ON THE SESSION THREAD (preserving the
+      single-thread invariant sleep obfuscation relies on), then
+      NtFreeVirtualMemory - the region never coexists writable and
+      executable and never outlives the task. No child process, no
+      CreateRemoteThread, no cross-process handle: Sysmon EID 8/10
+      stay dark by construction. Payload capped at 48 KB by the frame
+      ceiling; shellcode that never returns parks the beacon (stagers
+      that return are the intended shape). Detection is kernel-memory
+      ETW (RW to RX flip on an unbacked private region, no loader
+      involvement) and private-RX region scanning while the stage is
+      resident.
+    mitre_attack:
+      - T1055.012
+      - T1620
+    component: implant::execshc
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t022.md
+        status: experimental
+
+  - id: ABR-T023
+    name: Operational build hardening - compiled-in configuration and artifact hygiene
+    description: >
+      Operational artifacts embed the deployment configuration at
+      build time (ABRAHAM_EMBED JSON: server, key, tls pin, evasion
+      flags, malleable profile) under a build-random XOR keystream,
+      decoded through volatile reads so LTO cannot constant-fold the
+      plaintext into .rdata (fold observed and fixed). The CLI parser,
+      stderr logging and project strings exist only behind the
+      lab-args/lab-log features: operational builds carry zero
+      project-name/flag/log/PDB strings, no builder identity
+      (remap-path-prefix), abort silently on panic, and reconnect with
+      doubling backoff instead of a fixed interval. The paired
+      detection is the surface this removes where it is still present:
+      legacy/lab builds expose the whole C2 configuration on the
+      process command line (Sysmon EID 1, sigma rule).
+    mitre_attack:
+      - T1027.013
+      - T1071.001
+    component: implant::main
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: sigma
+        path: detections/sigma/abr-t023_implant_cli_flags.yml
+        status: experimental
+      - type: guidance
+        path: docs/detections/abr-t023.md
+        status: experimental
+
+  - id: ABR-T024
+    name: In-process AMSI and ETW patching before managed execution
+    description: >
+      Neutralizes the two user-mode instrumentation layers of the
+      implant's own process before running attacker-controlled managed
+      code: amsi.dll!AmsiScanBuffer is rewritten to `mov eax,
+      0x80070057; ret` (every scan reports E_INVALIDARG and succeeds)
+      and ntdll!EtwEventWrite to `xor eax, eax; ret` (events swallow).
+      Pages flip RW through the indirect-syscall layer, are written
+      via volatile stores, read back byte-exact and restored to their
+      original protection; amsi.dll loads on demand through the manual
+      export resolver (no IAT entry). Idempotent, no restore. Kernel
+      ETW (TI provider) is unaffected - documented as the defense that
+      outlives the patch.
+    mitre_attack:
+      - T1562.001
+      - T1562.002
+    component: implant::evasion::patch
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t024.md
+        status: experimental
+
+  - id: ABR-T025
+    name: Execute-assembly through bare CLR hosting
+    description: >
+      Runs an operator-supplied .NET Framework assembly inside the
+      implant with no powershell.exe and no dotnet.exe: bytes to a
+      randomly named temp .dll, then mscoree!CLRCreateInstance ->
+      ICLRMetaHost::GetRuntime(v4.0.30319) -> ICLRRuntimeInfo::
+      GetInterface -> ICLRRuntimeHost::Start -> ExecuteInDefaultApp-
+      Domain, invoking the operator convention `public static int
+      Method(string)`. All COM entry points resolve through the manual
+      export resolver; the vtable layouts follow the mingw-w64/wine
+      headers exactly (ICLRRuntimeInfo::GetInterface slot 9,
+      ICLRRuntimeHost Start slot 3 / ExecuteInDefaultAppDomain slot 11
+      - pinned by a live unit test that compiles its own proof
+      assembly with the in-box csc.exe). The CLR pins the temp file
+      without FILE_SHARE_DELETE, so the residue is deleted, marked
+      delete-on-close via NtSetInformationFile, or its path reported -
+      the disk flash is the technique's irreducible telemetry and the
+      paired detection anchor.
+    mitre_attack:
+      - T1620
+      - T1055
+    component: implant::clr
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: sigma
+        path: detections/sigma/abr-t025_clr_assembly_written_to_temp.yml
+        status: experimental
+      - type: guidance
+        path: docs/detections/abr-t025.md
+        status: experimental
+
+  - id: ABR-T026
+    name: In-process PowerShell execution with AMSI/ETW neutralized
+    description: >
+      The POWERSHELL task runs .ps1 scripts inside the implant's own
+      CLR instance - no powershell.exe, no child process. The
+      teamserver compiles tools/psboot.cs once with the in-box csc
+      (mscorlib-only references; System.Management.Automation loads
+      from the GAC at runtime through exact-signature reflection with
+      manual overload selection - binder-based lookups are ambiguous
+      against the generic Create/Invoke siblings) and ships the
+      bootstrap with the task. The implant patches AMSI and ETW first
+      (ABR-T024) - the runspace never sees a working AmsiScanBuffer
+      and script-block/module logging (which rides EtwEventWrite) is
+      silenced - then hosts/reuses the CLR (Start answers S_FALSE on
+      an already-running runtime), runs Boot.Run with
+      "<outpath>\n<script>", and returns the captured output.
+      Detection anchors: SMA/clr image loads into a non-.NET host
+      (sigma), memory scanning of the live script, the bootstrap disk
+      flash (ABR-T025 residue rules), and absence-of-4104 hunting.
+    mitre_attack:
+      - T1059.001
+      - T1562.001
+    component: implant::clr
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: sigma
+        path: detections/sigma/abr-t026_sma_loaded_by_non_powershell.yml
+        status: experimental
+      - type: guidance
+        path: docs/detections/abr-t026.md
+        status: experimental
+
+  - id: ABR-T027
+    name: In-memory native PE execution with exit redirection
+    description: >
+      The RUNPE task maps an operator-supplied native x64 PE (.exe or
+      .dll) inside the implant through a user-mode manual mapper:
+      sections into a fresh RW allocation, DIR64 relocations (empty
+      reloc directory on a moved image is legal - RIP-relative PEs
+      with load-time IAT), imports against live modules through the
+      manual export resolver, whole image flipped RX, entry point run
+      on a dedicated RtlCreateUserThread thread waited synchronously
+      on the session thread (ekko invariant preserved). The resolver
+      redirects ExitProcess/TerminateProcess/RtlExitUserProcess/exit/
+      _exit/_Exit to a 12-byte stub tail-jumping to the real
+      ExitThread with the exit code in RCX - a console EXE cannot take
+      the implant down. Transport: 48 KB inline; larger PEs via upload
+      with the stage deleted right after mapping. Documented
+      limitations (empirical): CRT/TLS payloads fault (no loader -
+      TLS never materialized; no_std payloads are the supported shape),
+      an entry's plain return is not the thread exit code, real PEB
+      visible, no TLS callbacks, ordinal imports abort. Detection:
+      unbacked full-PE RX private regions, LoadLibrary bursts without
+      loader context, RtlCreateUserThread attribution on kernel ETW.
+    mitre_attack:
+      - T1055.012
+      - T1620
+    component: implant::runpe
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t027.md
+        status: experimental

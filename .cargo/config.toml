@@ -1,0 +1,14 @@
+# Local build-path hygiene: panic locations and libyaml-style asserts
+# otherwise embed absolute paths of the build machine (username included)
+# into release artifacts. The remaps apply to every crate compiled in
+# this workspace. CI runners do not need them (their paths carry no
+# personal identity), and the mapping is harmless when it does not match.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "--remap-path-prefix=C:\\Users\\antho\\.cargo=/cargo",
+    "--remap-path-prefix=C:\\Users\\antho\\abraham=/src",
+    # Strip the linker debug directory (RSDS + PDB path) from release
+    # artifacts; cargo's `strip = "symbols"` does not remove it on MSVC.
+    "-C",
+    "link-arg=/DEBUG:NONE",
+]

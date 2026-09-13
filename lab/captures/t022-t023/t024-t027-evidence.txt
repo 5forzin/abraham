@@ -1,0 +1,59 @@
+ABR-T024/T025/T026/T027 lab evidence — 2026-09-12 (host VAQK + VM ABRAHAM)
+
+T026 IN-PROCESS POWERSHELL (host unit proof, in-process)
+  ps: hr=0x00000000 rc=0 (amsi=patched,etw=patched)
+  ps-proof:4919   [boot residue: <temp>\<rand>-ps.dll]
+  Bootstrap = tools/psboot.cs compiled with the in-box csc
+  (mscorlib-only refs, SMA from the GAC at runtime). THREE reflection
+  iterations recorded: binder InvokeMember -> AmbiguousMatchException
+  (generic Create<T>/Invoke siblings); GetMethod(name, EmptyTypes) ->
+  still ambiguous (binder selects among ALL same-name methods);
+  manual per-method overload selection loop -> works. .NET 4
+  GetMethod(name,Type[],Binder,...) overloads are 4+-arg only on 4.5+.
+
+T026 VM LIVE (session 2, integrity=high, ekko armed, fresh process)
+  [2] ps: hr=0x00000000 rc=0 (amsi=patched,etw=patched) ps-vm:4919
+  — script output 0x1337 captured through the out-file roundtrip.
+
+  ASSEMBLY STALENESS FINDING (the debugging arc worth keeping): after
+  recompiling psboot.cs, the VM kept executing the OLD bootstrap
+  (InvokeMember stacks) despite the task carrying the NEW bytes — the
+  default AppDomain resolves the loaded Boot assembly by simple name,
+  so the first-loaded version shadows every update until the implant
+  process restarts. Host never showed it (fresh test process each
+  run). Operational rule documented in abr-t026.md: rotate bootstrap
+  with implant builds; version the assembly name when iterating.
+
+T027 RUNPE (host proofs, rustc-compiled on demand)
+  exe (no_std, IAT ExitProcess(0x1337)):
+    runpe exe exit=0x1337 — the ExitProcess->ExitThread redirect works
+    and the hosting test process survived (asserted by the suite
+    continuing).
+  dll (no_std, DllMain -> ExitThread(0x1337)): exit=0x1337.
+  Engine findings on the way:
+  - RVA != file offset (FileAlignment 0x200 vs SectionAlignment 0x1000):
+    import/reloc walkers translated through the section table after
+    garbage module names ("ordinal import in <mojibake>") exposed it.
+  - NtProtectVirtualMemory OldProtection (a5) must be a real pointer:
+    NULL answers 0xC0000005 (stub protect silently failed first).
+  - RtlCreateUserThread is a regular ntdll function: syscalls::resolve
+    (Hell's Gate) rejects non-stub exports — export_address instead.
+  - GetExitCodeThread must run BEFORE NtClose (closed handle -> 0).
+  - An entry's plain return is NOT the thread exit code on NT —
+    payloads exit explicitly (proofs call ExitThread/ExitProcess).
+  - CRT/TLS payloads (rust std exes) fault without the loader (TLS
+    never materialized into the TEB): recorded limitation; no_std is
+    the supported shape for RUNPE, std targets use exec/execasm/psrun.
+  - tiny rustc PEs are RIP-relative with an EMPTY reloc directory and
+    still run at any base: empty-reloc + moved base is legal (rule
+    relaxed from fail-closed abort).
+
+T027 VM LIVE (session 1, ekko armed)
+  [2] runpe: inline 3072B exit=0x1337
+  — the 3 KB no_std proof exe mapped, relocated, imports resolved
+  against live modules, ran on the RtlCreateUserThread payload thread
+  and its ExitProcess became ExitThread inside the implant.
+
+TESTS: workspace 16+70; release serial --include-ignored 81/81
+  (execasm, powershell, runpe exe+dll, amsi/etw patches, ekko, spoof);
+  registry 27 techniques; sigma 0 issues; artifact audit clean.

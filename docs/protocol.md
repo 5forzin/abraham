@@ -10,7 +10,9 @@ The protocol is layered:
 
 ```
 +---------------------------------------------+
-| TLS 1.2/1.3 session (rustls, ring)          |  outer confidentiality
+| TLS 1.2/1.3 session (OS stack: Schannel on  |  outer confidentiality
+| Windows via native-tls; rustls on the       |
+| teamserver listener)                        |
 +---------------------------------------------+
 | HTTP/1.1 envelope (keep-alive POSTs)        |  malleable cover traffic
 +---------------------------------------------+
@@ -81,7 +83,7 @@ Implant                                    Teamserver
    |   shared = X25519(priv, peer_pub)         |
    |   keys    = HKDF-SHA256(shared,          |
    |             nonce_I || nonce_S,           |
-   |             "abraham-v1", 64 bytes)       |
+   |             "c2-hkdf-v1", 64 bytes)       |
    |   key_tx/key_rx split per direction       |
    |                                          |
    | -- POST (REGISTER frame) --------------> |
@@ -129,9 +131,40 @@ HTTP envelope rules:
   with a `RESULT` frame in that response's body.
 - URIs not in the profile yield HTTP 404; non-POST methods yield 405; a
   body over 8 MiB yields 413. Frames that fail authentication yield HTTP
-  400 and the connection is dropped.
-- Counter progression is enforced per direction across the whole TLS
-  connection (not per HTTP request).
+  400 for that request — the connection itself survives, because other
+  sessions may be riding it (see connection pooling below).
+- Counter progression is enforced per direction per session (not per HTTP
+  request and not per TCP connection).
+
+### 5.1 Session demux (connection pooling)
+
+A fronting proxy (Cloudflare et al.) terminates the client TLS and pools
+origin connections: requests from several implant transports can arrive
+INTERLEAVED on one server-side TCP connection. The server therefore never
+binds protocol state to the connection. Every implant POST tags itself
+with cover-envelope headers:
+
+- `X-Session: <session_token>` — decimal u64; routes the request to its
+  session. Present on every protocol POST (handshake included).
+- `X-Handshake: 1` — marks the POST body as a raw ClientHello.
+
+Server-side routing per POST: a handshake parks its derived keys under
+the announced token (a "provisional"); the REGISTER that follows (same
+token, possibly arriving on a different pooled connection) binds or
+resumes the session and adopts those keys; every later request decrypts
+under the current session keys regardless of which origin connection
+delivered it. A request whose frames fail to decrypt costs itself
+(HTTP 400) — never the connection or the session.
+
+Routing by header grants nothing on its own: the token only selects
+keys, and frames must still authenticate under them (AES-GCM, strictly
+increasing counters). Headerless requests still work through a
+connection-bound legacy path (one handshake + session per connection).
+
+Defensive note: the demux headers are visible to any middlebox that
+terminates the outer TLS (the CDN edge always does) — a per-host
+correlation handle for beacon traffic, joining requests of one implant
+process even as its origin connections churn.
 
 ## 6. Message types
 
@@ -162,7 +195,7 @@ before issuing the next poll.
 | domain | string | may be empty |
 | pid / ppid | u32 | |
 | arch | u8 | `0=arm64`, `1=x64` |
-| integrity_level | u8 | `0=low`, `1=medium`, `2=high`, `3=system` |
+| integrity_level | u8 | token SID RID via `NtQueryInformationToken`: `0=unknown`, `1=low`, `2=medium`, `3=high`, `4=system`, `5=protected` |
 | os_build | string | e.g. `10.0.19045` |
 | implant_version | string | semver |
 
@@ -195,6 +228,15 @@ Phase 3 addition:
 | task_type | Name | Notes |
 |---|---|---|
 | `0x07` | DRIVER | Kernel-driver staging lifecycle through the SCM (ABR-T013). Payload after the task id: `action` u8 (`0=load`, `1=unload`, `2=probe`, `3=elevate`, `4=gate`, `5=hide`, `6=unhide`, `7=call`, `8=call-preflight`, `9=map`, `0x0A=modhide`, `0x0B=modshow`, `0x0C=protect`, `0x0D=chan`), `service` string, `source` string, `drop_path` string. `load` copies `source` to `drop_path`, registers a demand-start kernel service on it and starts it; `unload` stops/deregisters the service and removes the staged file; `probe` (ABR-T014) opens every known vulnerable-driver device and proves arbitrary kernel read on the first that answers (no staging fields required) |
+
+Phase 4 addition:
+
+| task_type | Name | Notes |
+|---|---|---|
+| `0x08` | EXEC | In-process shellcode execution (ABR-T022). Payload after the task id: `data` blob (48 KB frame cap). The implant copies the blob to a private RW region via indirect syscalls, flips it RX, calls it as `fn(usize) -> usize` on the session thread and frees the region; the result reports `exec: <n>B ret=<hex>` |
+| `0x09` | EXECASM | In-process .NET assembly execution via bare CLR hosting (ABR-T025), optionally preceded by AMSI/ETW patching (ABR-T024). Payload after the task id: `data` blob (48 KB cap), `type_name` string, `method_name` string, `argument` string, `patch` u8. Invokes the operator convention `public static int <method_name>(string)` and reports the managed exit code plus the temp-file residue disposition |
+| `0x0A` | POWERSHELL | In-process PowerShell (ABR-T026): `script` string, `bootstrap` blob (compiled from tools/psboot.cs by the teamserver). AMSI/ETW patched first; the script's captured output is returned as the result |
+| `0x0B` | RUNPE | In-memory native PE execution (ABR-T027): `data` blob (48 KB cap) or `path` string of an uploaded stage deleted after mapping. Reports the payload thread's exit code |
 
 ### 6.3 RESULT payload
 

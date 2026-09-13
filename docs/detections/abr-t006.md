@@ -79,3 +79,33 @@ window exists only while the thread is in an alertable wait.
    selected lab sensor.
 5. Store the trace and memory-probe evidence under `lab/captures/` before
    promoting this guidance and ABR-T006 to `experimental`.
+
+## Residual plaintext surface during the encrypted window (2026-09-12)
+
+Ekko encrypts the executable section only. A memory image taken while
+the beacon sleeps still contains, in plaintext:
+
+- the session keys (`Session` holds both AES-256-GCM cipher keys in the
+  async task state on the heap) — they are long-lived by design and
+  never encrypted;
+- `.data`/`.bss`, both real stacks (ekko erases only the dead area
+  below RSP before sleeping), and any heap buffers not yet collected —
+  task command strings, module output, downloaded data;
+- the decoded embedded configuration early in process life, and the
+  malleable profile for the whole process lifetime.
+
+Mitigations shipped (2026-09-12 hardening pass): task frames, shell
+commands, module arguments, shellcode payloads, download buffers and
+upload buffers are zeroed through `secure_clear` (volatile writes) as
+soon as the session thread is done with them, and the embedded
+configuration buffer is zeroed right after decode. This narrows the
+window for task-content recovery to the duration of the task itself.
+
+Defender guidance: a dump taken mid-sleep still yields the session
+keys — the reliable blue-side play. Decrypting captured traffic with
+recovered keys plus extracting the profile (URIs, UA, timing) works
+even against a fully armed implant; scanning for task remnants only
+works for tasks in flight at dump time. Conversely, hunting for the
+*encrypted* window itself (RX pages whose hash flips on a 5+ second
+cadence) remains the primary detection of the technique rather than of
+its residue.

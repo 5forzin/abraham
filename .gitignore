@@ -24,3 +24,7 @@ loot/
 # OS
 Thumbs.db
 .DS_Store
+cache/
+
+# Deploy scratch (built stage binaries)
+deploy/avln/.build/

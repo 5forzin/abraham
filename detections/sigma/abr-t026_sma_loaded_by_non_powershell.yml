@@ -1,0 +1,37 @@
+title: System.Management.Automation Loaded by Non-PowerShell Host (ABR-T026)
+id: 8e4a7c1d-5f39-4b7e-9c2d-6a1b8f3e5d07
+status: experimental
+description: >
+  Detects System.Management.Automation.dll loading into a process that
+  is not a PowerShell host — the signature of in-process PowerShell
+  execution (C2 runspaces, powerpick-style execution). In Abraham this
+  is ABR-T026 running .ps1 scripts inside the implant after AMSI/ETW
+  patching (ABR-T024), which silences script-block logging that would
+  otherwise catch the content.
+references:
+  - https://attack.mitre.org/techniques/T1059/001/
+  - https://github.com/sforzin/abraham/blob/main/registry/techniques.yaml
+author: Anthony Sforzin
+date: 2026/09/12
+tags:
+  - attack.execution
+  - attack.t1059.001
+logsource:
+  category: image_load
+  product: windows
+detection:
+  selection:
+    ImageLoaded|endswith: '\System.Management.Automation.dll'
+  filter_known_hosts:
+    Image|endswith:
+      - '\powershell.exe'
+      - '\pwsh.exe'
+      - '\powershell_ise.exe'
+      - '\WindowsAzureGuestAgent.exe'
+      - '\MicrosoftMonitoringAgent.exe'
+      - '\SCCMClient.exe'
+  condition: selection and not filter_known_hosts
+falsepositives:
+  - Legitimate .NET services embedding PowerShell (add to the filter
+    list per estate; pair with a CLR-load correlation to reduce noise)
+level: medium

@@ -5,11 +5,32 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 32;
 const CHUNK: usize = 4096;
 
+/// Demux headers of the cover envelope. A fronting proxy that pools
+/// origin connections (Cloudflare et al.) can interleave requests from
+/// several logical beacon transports on ONE server-side connection, so
+/// every protocol POST tags itself: `X-Session` carries the session
+/// token for routing and `X-Handshake: 1` marks a ClientHello POST.
+/// Both ride inside the outer TLS; routing alone grants nothing — frames
+/// still have to decrypt under the session key.
+pub const HDR_SESSION: &str = "X-Session";
+pub const HDR_HANDSHAKE: &str = "X-Handshake";
+
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     pub method: String,
     pub uri: String,
     pub body: Vec<u8>,
+    /// Header names lowercased; values as raw bytes.
+    headers: Vec<(String, Vec<u8>)>,
+}
+
+impl HttpRequest {
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_slice())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +73,7 @@ fn invalid(message: &str) -> io::Error {
 pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Option<HttpRequest>> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; CHUNK];
-    let (method, uri, header_end, content_length) = loop {
+    let (method, uri, header_end, content_length, headers) = loop {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut preq = httparse::Request::new(&mut headers);
         match preq.parse(&buf) {
@@ -63,7 +84,12 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Op
                     .to_string();
                 let uri = preq.path.ok_or_else(|| invalid("missing uri"))?.to_string();
                 let length = content_length_of(preq.headers)?;
-                break (method, uri, offset, length);
+                let headers = preq
+                    .headers
+                    .iter()
+                    .map(|h| (h.name.to_ascii_lowercase(), h.value.to_vec()))
+                    .collect();
+                break (method, uri, offset, length, headers);
             }
             Ok(httparse::Status::Partial) => {}
             Err(e) => return Err(invalid(&format!("malformed request: {e}"))),
@@ -92,22 +118,38 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Op
         buf.extend_from_slice(&tmp[..n]);
     }
     let body = buf[header_end..total].to_vec();
-    Ok(Some(HttpRequest { method, uri, body }))
+    Ok(Some(HttpRequest {
+        method,
+        uri,
+        body,
+        headers,
+    }))
 }
 
-/// Writes an HTTP/1.1 keep-alive request with a binary body.
+/// Writes an HTTP/1.1 keep-alive request with a binary body and extra
+/// header lines (`(name, value)` pairs, sent verbatim).
 pub async fn write_request<S: AsyncWrite + Unpin>(
     stream: &mut S,
     method: &str,
     uri: &str,
     host: &str,
     user_agent: &str,
+    extra_headers: &[(&str, &str)],
     body: &[u8],
 ) -> io::Result<()> {
-    let head = format!(
-        "{method} {uri} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-        body.len()
+    let mut head = format!(
+        "{method} {uri} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {user_agent}\r\nContent-Type: application/octet-stream\r\n"
     );
+    for (name, value) in extra_headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        body.len()
+    ));
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body).await?;
     stream.flush().await
@@ -183,6 +225,7 @@ mod tests {
             "/api/v1/telemetry",
             "h:1",
             "agent/1",
+            &[(HDR_SESSION, "4242"), (HDR_HANDSHAKE, "1")],
             b"\x00\x01\x02AB",
         )
         .await
@@ -191,6 +234,10 @@ mod tests {
         assert_eq!(req.method, "POST");
         assert_eq!(req.uri, "/api/v1/telemetry");
         assert_eq!(req.body, b"\x00\x01\x02AB");
+        assert_eq!(req.header("x-session"), Some(&b"4242"[..]));
+        assert_eq!(req.header("X-SESSION"), Some(&b"4242"[..]));
+        assert_eq!(req.header("x-handshake"), Some(&b"1"[..]));
+        assert_eq!(req.header("x-missing"), None);
     }
 
     #[tokio::test]
@@ -214,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn empty_body_request() {
         let (mut a, mut b) = tokio::io::duplex(4096);
-        write_request(&mut a, "POST", "/x", "h", "ua", b"")
+        write_request(&mut a, "POST", "/x", "h", "ua", &[], b"")
             .await
             .unwrap();
         let req = read_request(&mut b).await.unwrap().unwrap();

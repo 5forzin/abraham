@@ -1,0 +1,44 @@
+ABR-T022 / ABR-T023 lab evidence — 2026-09-12 (host VAQK + VM ABRAHAM, build 26200)
+
+TEAMSERVER (new binary, HKDF domain separator renamed to c2-hkdf-v1)
+  [*] server identity: 2bd4bd7ffed067eb149c25f85a54471cc28d73f0c2795b1eb9770426e74adab5
+  [*] tls cert sha256: 7bfc00a2b1f9e5cdb2bf0888379f792833378304e945b100d0ec60258b59d2d3
+
+EMBEDDED BUILD (host, ABRAHAM_EMBED, no lab features, zero command line)
+  session 2: VAQK\antho@VAQK, integrity_level=2 (medium, real token SID)
+  Win32_Process CommandLine for the embedded implant: <empty — no args at all>
+  exec (proof stage mov eax,0x1337; ret):
+    [7] status=0 :: exec: 6B ret=0x1337
+  whoami:
+    VAQK\antho@VAQK pid=7004 ppid=28740 integrity=medium build=10.0.26200
+  netstat/env: full TCP/UDP owner-pid table + environment dump (status=0)
+
+STATIC OPSEC AUDIT (operational artifact, target/release/abraham-implant.exe)
+  clean: 'abraham' (any case), 'abraham-implant', PDB path, 'usage:',
+          --server/--key/--evasion/--tls-pin, 'evasion armed',
+          'session ended', 'ppid spoof unavailable', 'C:\Users' builder
+          identity, '.cargo' registry paths, embedded config plaintext
+          (XOR'd; LTO const-fold of the decode was found and killed with
+          volatile reads — without it the whole config appears in .rdata)
+  residual: 75 x '/rustc/<hash>/library/...' std panic-location paths
+            (inherent to stable rustc; documented in abr-t023.md)
+  size: 2.79 MB -> 1.98 MB (tokio features trimmed, lto, strip)
+
+VM LAB BUILD (--features lab-log, ekko armed, elevated guest session)
+  session 3: Abraham\lab@ABRAHAM, integrity_level=3 (high, real)
+  whoami:
+    Abraham\lab@ABRAHAM pid=2228 ppid=2340 integrity=high build=10.0.26200
+  ps (detail pass, TSV pid/ppid/threads/handles/name/path/cmdline):
+    0    0    12   0    System    - -
+    4    0    174  1920 System    - -
+    124  4    4    0    Registry  Registry -
+    468  4    2    58   smss.exe  \Device\HarddiskVolume3\Windows\System32\smss.exe \SystemRoot\S...
+  netstat: VM TCP table with owner pids (LISTEN 135/445/5040/7680/49664...)
+  exec: [12] status=0 :: exec: 6B ret=0x1337   (ekko ACTIVE between polls)
+  vm-lab-build-cmdline.txt: the lab flavor's full flag surface on EID 1 —
+    the exact detection abr-t023_implant_cli_flags.yml keys on, and the
+    surface the embedded build removes (empty command line, same session
+    shape)
+
+TESTS: workspace 16+66 green; release serial --include-ignored 71/71;
+      registry 23 techniques; sigma check: 0 issues.

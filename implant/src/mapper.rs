@@ -581,7 +581,7 @@ pub(crate) fn proof_driver_image() -> Vec<u8> {
     file[sec2 + 36..sec2 + 40].copy_from_slice(&0xC000_0040u32.to_le_bytes());
     // .text: code + signature string.
     file[0x200..0x200 + code.len()].copy_from_slice(&code);
-    let signature = b"abraham-kdmapper\0";
+    let signature = b"kmapper-proof\0";
     file[0x200 + 0x40..0x200 + 0x40 + signature.len()].copy_from_slice(signature);
     // .idata: descriptor + terminator (zeros through +0x28), thunk
     // arrays, import-by-name, module name, one DIR64 relocation block
@@ -819,8 +819,8 @@ pub fn chan_action(cmd: &str) -> Result<Vec<u8>, String> {
 }
 
 /// The proof-scratch magic the builtin payload stamps: `0x0DEFACED`
-/// plus the first signature byte ('a') in byte 4.
-const PROOF_MAGIC: u64 = 0x0000_0061_0DEF_ACED;
+/// plus the first signature byte ('k') in byte 4.
+const PROOF_MAGIC: u64 = 0x0000_006B_0DEF_ACED;
 
 /// DRIVER `map` action (ABR-T018): map an unsigned driver into the
 /// kernel through iqvw64e and — for the builtin payload — prove the

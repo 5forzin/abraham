@@ -246,8 +246,73 @@ tasking (e.g. fetched from LOLDrivers by the operator, never committed).
       DKOM round-trip, capability gate, EID 6 telemetry; registry
       ABR-T013..T016 all lab_validated with paired detections
 
+## Phase 3.9 — Implant hardening & utility (review pass, 2026-09-12)
+
+Full-project review findings executed in priority order; every change
+ships with its paired detection or guidance.
+
+- [x] A1+A2 compiled-in operational configuration (ABRAHAM_EMBED,
+      build-random XOR, volatile decode — the LTO constant-fold of the
+      plaintext was found and killed empirically) + artifact hygiene:
+      lab-args/lab-log features, strip+panic-abort+lto, /DEBUG:NONE
+      (strip alone leaves the RSDS on MSVC), path remaps, HKDF/domain
+      string renames, reconnect backoff, fail-closed server default.
+      Static audit: zero project/flag/PDB/builder strings; CI gates it
+      (ABR-T023)
+- [x] Real registration data: ppid via ProcessBasicInformation, token
+      integrity SID, RtlGetVersion build (was: 0/1/"Windows_NT")
+- [x] ps detail pass (image path + command line per pid through
+      spoofed NT queries), netstat (TCP/UDP owner tables), env module
+- [x] EXEC task: in-process shellcode, RW->RX->call->free on the
+      session thread, no child/thread/cross-handle (ABR-T022, host
+      proof `exec: 6B ret=0x1337`)
+- [x] secure_clear of commands/args/payloads/downloads + embedded
+      config buffer; residual-surface section added to
+      docs/detections/abr-t006.md (session keys remain the blue-side
+      win — documented)
+- [x] Execute-assembly (ABR-T025): bare CLR hosting in-process, all
+      COM entry points through the manual resolver, vtable layouts
+      pinned to the mingw-w64/wine headers and a live unit proof that
+      compiles its own assembly with the in-box csc.exe; residue
+      handling reported honestly (CLR pins the temp file — EID 11 is
+      the anchor and the artifact persists)
+- [x] AMSI/ETW in-process patching (ABR-T024): AmsiScanBuffer ->
+      E_INVALIDARG stub, EtwEventWrite -> xor eax/eax;ret, volatile
+      writes with readback, restore of page protections, idempotent
+- [x] netstat IPv6 owner tables (TCP6/UDP6 rows, RFC 5952 formatter)
+- [x] In-process PowerShell (ABR-T026): bootstrap compiled server-side
+      from tools/psboot.cs (exact-signature reflection, manual overload
+      selection), AMSI/ETW patched first, CLR reused across tasks
+      (Start S_FALSE accepted), captured output returned as the result
+- [x] In-process PowerShell (ABR-T026) — final piece of the AMSI
+      story: scripts never enter a fresh powershell.exe; see Part 10
+- [x] In-memory native PE execution (ABR-T027): user-mode manual
+      mapper + RtlCreateUserThread payload thread + ExitProcess-family
+      redirect to ExitThread; no_std proof payloads compiled by the
+      tests with rustc; CRT/TLS limitation recorded honestly
+- [x] Redirector deployment pattern: --plain-c2 server mode +
+      deploy/redirector (nginx real-TLS front; kills the rustls-JA3 vs
+      Chrome-UA contradiction and the self-signed leaf IOC)
+- [x] LAB: live VM pass for T022/T023 — session 3 (Abraham\lab,
+      integrity=high real, build 26200) with ekko armed: ps detail
+      pass, netstat, env and `exec: 6B ret=0x1337` all green;
+      lab-build command line captured as the T023 sigma's positive
+      control (docs/lab/2026-09-12-implant-hardening.md,
+      lab/captures/t022-t023/)
+
 ## Phase 4 — Consolidation
 
+- [x] Frame session tagging: cover-envelope `X-Session`/`X-Handshake`
+      headers route every POST to its session, so server-side routing
+      survives CDN origin-connection pooling (observed behind Cloudflare:
+      foreign requests land on a live session's origin connection; a bad
+      frame now costs the request, never the connection — see
+      docs/lab/2026-09-12-implant-hardening.md Part 11, protocol.md §5.1)
+- [x] Teamserver session persistence (`state/sessions.json`): a redeploy
+      restart keeps sessions (ids, tokens, results); beacons RESUME into
+      the same session id and drain tasks queued while offline (deploy
+      restarts are routine now — `deploy/avln/push.sh` — so history must
+      survive them)
 - [ ] ATT&CK coverage matrix generated from the registry
 - [ ] Lab automation: technique → telemetry → detection validation pipeline
 - [ ] Detection pack release (Sigma + Sysmon config + queries)

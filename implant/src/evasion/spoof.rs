@@ -457,12 +457,12 @@ mod tests {
         let (_exit, output) = evasion.run_command("whoami").expect("run_command");
         let text = String::from_utf8_lossy(&output);
         assert!(
-            text.contains("[abraham] ppid spoof unavailable"),
+            text.contains("[i] fallback spawn"),
             "fallback note missing: {text}"
         );
         let command_lines = text
             .lines()
-            .filter(|line| !line.starts_with("[abraham]"))
+            .filter(|line| !line.starts_with("[i]"))
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .count();

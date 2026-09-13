@@ -7,3 +7,14 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Anthony Sforzin"]
 license = "MIT"
+
+# Operational-artifact hygiene (ABR-T023): no symbol table (removes the
+# PDB path from the debug directory), whole-program LTO with one codegen
+# unit, and abort-on-panic (unwind machinery and panic paths gone).
+# cargo ignores `panic` for test targets with a warning, so test runs
+# keep unwinding.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

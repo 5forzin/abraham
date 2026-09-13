@@ -1,0 +1,35 @@
+title: Implant Configuration Flags on a Process Command Line (ABR-T023)
+id: 7c2f5d9a-4b1e-4a8c-b3f6-2e7d1c9a4b02
+status: experimental
+description: >
+  Detects a process launched with Abraham implant configuration flags
+  (--tls-pin, --evasion ekko,ppid, --server together with --key). Lab
+  builds and any legacy artifact carry the whole C2 configuration on the
+  command line, so a single Sysmon EID 1 event discloses the teamserver
+  address, the pinned key and the armed evasion state. Operational
+  builds embed this configuration at compile time (ABR-T023) precisely
+  to remove this surface — the rule catches every build that did not.
+references:
+  - https://github.com/sforzin/abraham/blob/main/registry/techniques.yaml
+author: Anthony Sforzin
+date: 2026/09/12
+tags:
+  - attack.command-and-control
+  - attack.t1071.001
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_flagged:
+    CommandLine|contains|all:
+      - '--server'
+      - '--key'
+  selection_evasion:
+    CommandLine|contains:
+      - '--evasion ekko'
+      - '--tls-pin'
+  condition: 1 of selection_*
+falsepositives:
+  - Benign tooling that happens to accept --server and --key together
+    (rare; combine with parent/child context before escalating)
+level: high

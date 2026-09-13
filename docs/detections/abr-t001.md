@@ -1,7 +1,9 @@
 # ABR-T001 — Detection guidance: encrypted C2 channel over HTTPS
 
 Status: `experimental` (validated in the purple lab on 2026-09-10, see
-`docs/lab/2026-09-10-vm-validation.md`).
+`docs/lab/2026-09-10-vm-validation.md`; TLS-stack section updated
+2026-09-12 after the implant moved to the OS TLS stack — see
+`docs/lab/2026-09-12-implant-hardening.md` Part 11).
 
 Scope: the implant's outer HTTPS transport (X25519/AES-256-GCM inner
 session, see `docs/protocol.md`). The inner session is invisible to network
@@ -12,38 +14,74 @@ monitors by design — detection focuses on the outer flow.
 | Source | Event / field | Notes |
 |---|---|---|
 | Sysmon | EID 3 (Network Connection) | process → destination IP/port correlation (validated, see below) |
-| ETW | `Microsoft-Windows-Schannel`, `Microsoft-Windows-WinHTTP` | only applies to implants using OS TLS stacks — abraham v0.1.0+ uses rustls/ring in-process, so Schannel telemetry stays **silent**; a non-browser process emitting TLS with zero Schannel activity is itself an anomaly worth alerting on |
+| ETW | `Microsoft-Windows-Schannel` | the implant now negotiates TLS through Schannel (SSPI), so handshake/error events for a **non-browser process** become visible — see detection idea 6 |
 | Proxy | HTTP access logs | user agent, URI patterns, timing — requires TLS interception; otherwise only connection metadata is visible |
-| Zeek | `ssl.log`, `http.log` | JA3/JA4 fingerprints, certificate details, SNI (abraham sends the destination IP, not a hostname, as SNI/server_name) |
+| Zeek | `ssl.log`, `http.log` | JA3/JA4 fingerprints, certificate details, SNI. Direct-IP lab builds send an IP as SNI; domain builds (e.g. avln behind Cloudflare) present the C2 domain, and the JA3/JA4 is **Schannel's** — indistinguishable from ordinary Windows HTTPS on the wire |
+
+## TLS stack note (two eras)
+
+- **Before 2026-09-12** the implant carried rustls/ring in-process:
+  Schannel telemetry stayed silent while TLS flowed — a non-browser
+  process emitting TLS with zero Schannel activity was itself the
+  anomaly, and the rustls JA3/JA4 stood out from browser baselines.
+- **From 2026-09-12** the implant uses the OS stack (Schannel on
+  Windows) specifically to defeat middleboxes that hold non-browser
+  ClientHellos (measured against Fortinet DPI: rustls took ~16 min to
+  pass; Schannel connects in seconds). Wire fingerprints and Schannel
+  activity are now identical to legitimate Windows traffic — the
+  TLS-layer signals below no longer fire for the current build. They
+  remain valid against the older artifacts and any custom-stack
+  rebuild.
 
 ## Detection ideas
 
-1. **TLS fingerprinting**: a Rust TLS stack (rustls) produces a distinct
-   JA3/JA4 signature from browser baselines. Alert on non-browser JA4s that
-   also appear in low-volume, recurring flows.
+1. **TLS fingerprinting (legacy builds)**: a Rust TLS stack (rustls)
+   produces a distinct JA3/JA4 signature from browser baselines. Alert
+   on non-browser JA4s that also appear in low-volume, recurring flows.
 2. **Certificate anomalies**: self-signed or recently-issued certificates on
    destinations contacted by non-browser processes.
 3. **Sinkhole/generic names**: listener infrastructure frequently presents
    generic RDNS; combine with rarity scoring of the destination ASN.
+   Domain-fronted deployments (CDN edge in front of the origin) hide the
+   origin ASN — pivot to per-process flow baselines instead.
 4. **Volume asymmetry**: C2 check-ins produce many short sessions with
    near-constant request sizes; flag flows where std-dev of request size is
-   unusually low over a rolling window.
-5. **IP-as-SNI**: abraham's rustls client connects by IP (server_name is an
-   IP address, no hostname). TLS flows to port 443/8443 with IP SNI from a
-   non-browser process are high-signal.
+   unusually low over a rolling window. Validated against the 2026-09-10
+   capture; still true behind a CDN edge (only the destination IP changes
+   to the edge).
+5. **IP-as-SNI (lab builds)**: direct-IP configurations connect with an IP
+   as server_name (no hostname). TLS flows to port 443/8443 with IP SNI
+   from a non-browser process are high-signal.
+6. **Schannel ownership (current builds)**: Schannel now executes the
+   handshake for the implant process. Correlate
+   `Microsoft-Windows-Schannel` operational events (handshake failures,
+   fatal alerts — including the CDN-edge 400/reset retries) with Sysmon
+   EID 3 for the same PID: a non-browser, non-service process with a
+   steady Schannel session cadence to one destination is the residual
+   host-side signal once the wire looks native.
+7. **Demux header correlation (network side, 2026-09-12)**: every
+   protocol POST carries `X-Session: <token>` in the clear at the
+   outer-TLS layer (protocol.md §5.1). Any middlebox that terminates
+   TLS — the CDN edge always does; enterprise SSL-inspection proxies
+   would — sees a stable per-implant-process token that joins the
+   beacon's requests across connection churn and IP rotation. Alert on
+   a recurring custom header whose value is a decimal u64 on
+   keep-alive POST flows from one source; the token is also an
+   IOC-grade pivot (it appears verbatim in the teamserver's
+   `state/sessions.json` when seized).
 
 ## Lab validation (2026-09-10, outer HTTPS)
 
-Implant (rustls TLS + HTTP envelope) against the teamserver in the VM lab,
-Sysmon 15.22 recording:
+Implant against the teamserver in the VM lab, Sysmon 15.22 recording:
 
 - **Sysmon EID 3 fires** for every connection attempt from
   `abraham-implant.exe` to the teamserver IP:port — including the rejected
   pre-TLS connections of an old raw-TCP build, which shows up as the same
   process contacting the same destination repeatedly (idea 4's periodicity
-  without any payload insight).
-- **Schannel stays silent** for the implant process while TLS traffic flows
-  (rustls in-process), confirming the anomaly in the telemetry table.
+  without any payload insight). Re-confirmed 2026-09-12 from the work
+  network through the Cloudflare edge (destination = edge IP).
+- **Schannel stays silent for the legacy rustls build** while TLS traffic
+  flows (in-process stack) — the anomaly that motivated idea 6's inverse.
 - URI/User-Agent/Server-header shaping is invisible to passive network
   observers by design; only TLS-intercepting proxies can evaluate the
   malleable metadata.

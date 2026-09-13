@@ -1,0 +1,50 @@
+ABR-T024 / ABR-T025 lab evidence — 2026-09-12 (host VAQK + VM ABRAHAM, .NET Framework 4.8)
+
+HOST UNIT PROOF (cargo test, in-process)
+  execasm: 3072B hr=0x00000000 ret=0x1337 file-deleted=false
+  delete-on-close=false residue=<temp>\863f982a.dll (amsi=patched,etw=patched)
+  - assembly compiled on the fly with the in-box csc.exe (C#5 library,
+    `public static class Prog { public static int Go(string) }`)
+  - patch tests: AmsiScanBuffer stub B8 57 00 07 80 C3 readback-exact,
+    idempotent; EtwEventWrite stub 31 C0 C3 readback-exact (serial-only
+    tests: both rewire global process instrumentation in parallel)
+  - delete-on-close helper proven on an uncontended file (POSIX delete
+    via NtOpenFile+NtSetInformationFile(FileDispositionInformation))
+
+VTABLE DISCOVERY (the part worth writing down)
+  1. First attempt used recalled GUIDs: GetRuntime answered
+     E_NOINTERFACE (0x80004002) — CLSID/IID of MetaHost were right, the
+     ICLRRuntimeInfo IID was not.
+  2. IID_IUnknown trick returned an object whose far slots were not the
+     ICLRRuntimeInfo layout: calling slot 10 crashed (0xC0000005) —
+     slot 10 was IsLoadable, not GetInterface.
+  3. Authoritative layouts pulled from real headers on disk-via-mirror:
+     mingw-w64 mscoree.h (CLSID_CLRRuntimeHost 0x90F1A06E...7A5EBA6BDB02,
+     IID_ICLRRuntimeHost 0x90F1A06C..., ICLRRuntimeHost vtable) and wine
+     metahost.h (IID_ICLRRuntimeInfo BD39D1D2-BA2F-486A-89B0-B4B0-CB466891,
+     ICLRRuntimeInfo vtable: GetVersionString=3 ... GetInterface=9).
+  4. Correct order: GetRuntime(IID_ICLRRuntimeInfo) -> GetInterface@9 ->
+     Start@3 -> ExecuteInDefaultAppDomain@11 — hr=0 all the way.
+  Residue reality: the CLR maps the assembly without FILE_SHARE_DELETE —
+  delete fails, POSIX delete-on-close open fails, so the result reports
+  the random-named residue path verbatim (operator/blue-team collect it;
+  EID 11 is the anchor and the file persists — sigma abr-t025).
+
+VM LIVE PROOF (session 4, Abraham\lab, integrity=high REAL, ekko armed)
+  task 3: execasm: 3584B hr=0x00000000 ret=0x1337 file-deleted=false
+  delete-on-close=false residue=C:\Users\lab\AppData\Local\Temp\0628d448.dll
+  (amsi=patched,etw=patched)  — session survived; beacon continued.
+
+  Deployment footgun recorded: an initial attempt queued EXECASM against
+  a stale implant binary (pre-0x09) — Message::decode rejected task kind
+  0x09, the `?` dropped the session and the implant reconnect-looped.
+  Symptom signature (session dies exactly on task arrival, process
+  alive) now recognized; redeploying the matched binary fixed it.
+
+NETSTAT IPv6: v4/v6 tables both queried through GetExtended{Tcp,Udp}Table
+  (AF_INET6=23; TCP6 row 56B, UDP6 row 28B; RFC5952 formatter unit-tested).
+  Guest (host-only networking) exposed no v6 rows in the 200-char result
+  preview; the v6 query paths run crash-free in the host test suite.
+
+TESTS: workspace 16+68; release serial suite includes the CLR proof and
+  both patch tests; registry 25 techniques; sigma 0 issues.

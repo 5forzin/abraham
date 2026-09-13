@@ -34,3 +34,23 @@ jobs:
         run: cargo test --workspace
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # ABR-T023 gate: the operational artifact (release, no lab
+      # features) must carry no project-identifying strings. This step
+      # exists so a regression reintroducing them fails the build.
+      - name: Artifact hygiene (release implant)
+        run: cargo build --release -p abraham-implant
+      - name: Static OPSEC audit
+        shell: bash
+        run: |
+          python - <<'EOF'
+          data = open('target/release/abraham-implant.exe','rb').read()
+          banned = [b'abraham', b'Abraham', b'.pdb', b'--server', b'--evasion',
+                    b'--tls-pin', b'usage:', b'evasion armed', b'session ended',
+                    b'ppid spoof unavailable', b'C:\\Users']
+          leaked = [p for p in banned if p in data]
+          if leaked:
+              print('LEAKED STRINGS:', leaked)
+              raise SystemExit(1)
+          print(f'artifact hygiene: clean ({len(data)} bytes, '
+                f'{data.count(b"/rustc/")} inherent std toolchain paths)')
+          EOF
