@@ -96,6 +96,17 @@ techniques:
       The implant uses waitable-timer APC completion routines to make its
       executable section writable, encrypt it with RC4 while dormant, restore
       the plaintext and executable protection, and then resume execution.
+      Sleep 2.0 (2026-09-13): the same APC cycle now also scrambles the
+      LIVE part of the stack - a prefill APC derives the inert upper
+      bound from its own delivery (everything above the kernel APC
+      dispatcher belongs to the beacon callers) and an RC4 pair ciphers
+      that window for the sleep interval, closing the "content vs
+      attribution" gap pinned by the dormant-window test - and the
+      registered sensitive heap buffers (embedded configuration text,
+      session cookie, the session AES key schedules) are ciphered
+      synchronously around the arming and restored after the wake
+      check. Mid-sleep dumps no longer yield session material from
+      stack or sensitive heap.
     mitre_attack:
       - T1027
       - T1497.003

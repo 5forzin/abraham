@@ -100,3 +100,46 @@ diagnostic (the lab host's clipboard is chronically held open —
 observed failing for every process including standalone PowerShell;
 VMware clipboard arbitration with a running guest is the prime
 suspect).
+
+## Part 3 — Sleep 2.0: live stack and sensitive heap under the cipher
+
+The Ekko cycle now covers what the 2026-09-11 dormant-window test
+exposed: a prefill APC derives, from inside its own delivery, the
+upper bound of the stack that is inert while the thread waits
+(everything above the kernel APC dispatcher's frames — the beacon
+callers), an RC4 pair scrambles that window for the sleep interval,
+and the registered sensitive heap buffers (embedded configuration
+text, session cookie, the session's AES key schedules) are ciphered
+synchronously around the timer arming and restored after the wake
+integrity check. Stage count 5 → 8; the arena grew two argument slots
+and a second key/USTRING block; the prefill is a leaf hand-asm stub
+with its own (empty) unwind program.
+
+Design notes worth keeping:
+
+- The async runtime parks the beacon state on the heap (inside the
+  run() future), so "the stack" alone was never the whole story — the
+  sensitive-heap registry (`evasion::register_sensitive`) is the
+  load-bearing half. The session keys are registered by address
+  inside the future, which is stable for the process lifetime.
+- The stack bound is captured once (prefill) and saved in the arena:
+  encrypt and decrypt MUST cover the exact same bytes, so the decrypt
+  stage reads the saved window instead of re-deriving it.
+- The heap-cipher key lives as a local of the sleep frame — which the
+  stack cipher then encrypts and restores bit-for-bit, so the post-wake
+  restore reads the same key without any extra storage.
+- Clearance is 0x800 above the prefill's own delivery: enough to skip
+  the kernel APC dispatcher frames, low enough that the beacon-caller
+  frames (and in the sync test, a padded marker) stay inside the
+  ciphered window. The geometry is documented in the test.
+
+Validation: `sleep2_scrambles_live_stack_and_restores` reads a
+plaintext marker in a sibling thread's caller frame from outside
+mid-sleep (ciphertext), then after the cycle (bit-for-bit plaintext);
+the classic ekko ignored suite still passes (external probe sees the
+image scramble, 300-cycle long run, private-buffer roundtrip now runs
+with the stack cipher active in the normal suite). The dormant-window
+"content vs attribution" gap is closed for the stack; the detection
+doc's idea 6 is marked mitigated and replaced by two new shapes:
+stack-entropy above an alertable wait, and sensitive-heap entropy
+pulsing in phase with the beacon cadence.

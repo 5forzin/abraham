@@ -2,11 +2,21 @@
 
 Status: `experimental` (Phase 2 lab validation 2026-09-11; see `docs/lab/2026-09-10-vm-validation.md` addendum).
 
-Scope: on the implant's current thread, five waitable-timer APC completion
+Scope: on the implant's current thread, waitable-timer APC completion
 routines change the image's executable section from RX to RW, encrypt it with
 RC4 through `SystemFunction032`, wait for the configured sleep interval,
 decrypt it, restore RX protection and signal the wake event. The encrypted
 window exists only while the thread is in an alertable wait.
+
+Sleep 2.0 (2026-09-13) extends the same cycle to the LIVE part of the stack
+and to registered sensitive heap buffers (embedded configuration text,
+session cookie, the AES key schedules of the session object): a prefill APC
+derives the upper bound of the stack that is inert during the wait
+(everything above the kernel APC dispatcher's frames), an RC4 pair scrambles
+that window for the sleep interval, and the heap regions are ciphered
+synchronously around the timer arming. A memory view of the dormant thread is
+now high-entropy in the image, the caller-stack frames AND the sensitive
+heap — a suspend-and-dump during sleep no longer yields session keys.
 
 ## Telemetry sources
 
@@ -40,17 +50,29 @@ window exists only while the thread is in an alertable wait.
    alertable wait while its process image is temporarily writable and fails an
    in-memory integrity check. Correlation reduces false positives from normal
    hot patching and JIT compilation.
-6. **Dormant-window stack attribution** (pinned 2026-09-11, build 26200 —
-   `evasion::sleep::tests::ekko_dormant_window_stack_attribution`): while the
-   target bytes are unreadable (RC4 window verified live), suspending the
-   sleeping thread and walking its context yields a fully legible chain —
-   ntdll wait stub → kernelbase `WaitForSingleObjectEx` → the hand-assembled
-   wait loop on a MEM_PRIVATE RX page (legible precisely because of ABR-T008)
-   → a dozen frames of the owning image → the canonical thread anchors.
-   Encryption hides memory CONTENT, not stack ATTRIBUTION: suspend-and-walk
-   analytics that hunt for sleeping threads whose stacks transit a private
-   executable region — or whose dormant wait returns into an image that is
-   simultaneously failing integrity — have a concrete, reproducible shape.
+6. **Dormant-window stack attribution** (pinned 2026-09-11, build 26200;
+   MITIGATED 2026-09-13 by Sleep 2.0): the original observation was that
+   while the image bytes were unreadable, suspending the sleeping thread and
+   walking its context yielded a fully legible chain down into the owning
+   image — "encryption hides memory CONTENT, not stack ATTRIBUTION". Sleep
+   2.0 encrypts the caller frames themselves, so a mid-sleep walk now sees
+   ciphertext above the APC dispatcher and terminates in garbage — the
+   attribution signal moved from "legible chain into a failing image" to the
+   NEW shape below.
+6a. **Stack entropy above an alertable wait** (new with Sleep 2.0): sample
+   the caller frames of a dormant thread (anything above the kernel APC
+   dispatcher depth): plaintext return addresses into loaded modules are
+   normal; a large contiguous window of high-entropy bytes in an otherwise
+   normal stack — aligned to the top of the committed region — is the
+   ciphered-frames signature. The old analytic inverted: hunters should now
+   look for walks that BREAK above a private-region wait loop, not ones that
+   succeed.
+6b. **Sensitive-heap entropy**: the registered buffers (configuration text,
+   session objects) read as high-entropy during the sleep window and return
+   to structured plaintext after wake; a scanner sampling the same heap
+   addresses across the cadence sees entropy pulse in phase with the beacon
+   sleep. Narrow regions that keep flipping between structured and
+   high-entropy states on a fixed period are the tell.
 
 ## Coverage limitations
 

