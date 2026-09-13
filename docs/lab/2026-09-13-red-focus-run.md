@@ -143,3 +143,13 @@ with the stack cipher active in the normal suite). The dormant-window
 doc's idea 6 is marked mitigated and replaced by two new shapes:
 stack-entropy above an alertable wait, and sensitive-heap entropy
 pulsing in phase with the beacon cadence.
+
+## Part 4 — Stomping hardening
+
+The phantom-DLL carver moved from a fixed two-entry candidate list to
+eight signed System32 DLLs (all verified present on the lab VM build)
+with per-process randomized order — a fixed order was itself an IOC:
+the same sacrificial DLL carved in the same position on every implant.
+Every candidate that maps remains eligible; failing maps (locked,
+missing, section too small) just advance the wrap-around. Detection
+doc and registry updated with the widened tripwire set.

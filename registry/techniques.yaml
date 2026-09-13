@@ -229,6 +229,12 @@ techniques:
       flips, and executes them from a MEM_IMAGE region named after the
       legitimate file — removing the MEM_PRIVATE executable-memory
       tripwire while staying absent from the module list.
+      Hardened 2026-09-13: the candidate list grew to eight signed
+      System32 DLLs and the carve order is randomized per process - a
+      fixed order was itself an IOC (the same sacrificial DLL in the
+      same position on every implant), and the randomized home varies
+      across hosts and runs while every candidate that maps stays
+      eligible.
     mitre_attack:
       - T1027
       - T1106

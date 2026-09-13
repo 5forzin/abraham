@@ -62,7 +62,7 @@ its own page from a process-lifetime view.
 5. **Sacrificial-DLL census.** Hunt processes mapping more than one view
    of the same System32 DLL, or views of DLLs with zero loaded-module
    references — the candidate list in any given toolkit is small and
-   public (`colorui.dll`, `dbgcore.dll`, ...), making the file path
+   public (`colorui.dll`, `dbgcore.dll`, `devobj.dll`, `dhcpcmonitor.dll`, `dbgeng.dll`, `framedyn.dll`, `mshtmled.dll`, `shsetup.dll` (order randomized per process since 2026-09-13 — a fixed order was itself an IOC: the same sacrificial DLL in the same position on every implant), ...), making the file path
    itself a workable indicator.
 
 ## What this technique does NOT remove

