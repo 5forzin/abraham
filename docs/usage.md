@@ -187,6 +187,18 @@ offline:
   the documented coverage-gap exhibit. The WinIo physical path is
   blacklisted (0x1A bugchecks) and stays unused.
 
+## COFF object tasks (ABR-T034)
+
+`bof <id> <local .obj> [int=42|short=7|str=hello ...]` links and runs
+a BOF-convention x64 object in-process: layout, relocations, a minimal
+Beacon API (BeaconOutput + the BeaconData* parser) and module-export
+resolution with in-image trampolines for far calls. Arguments pack
+server-side following the CS convention (`int=`/`short=`/`str=` pairs
+become the typed buffer `go` parses with BeaconDataParse). Output
+captured via BeaconOutput is the task result. Compatible with BOFs
+that stick to the Beacon API and plain Win32 externals; `BeaconPrintf`
+is accepted but not forwarded (documented limitation).
+
 ## Shellcode tasks (ABR-T022)
 
 `exec <id> <local-file>` queues an in-process shellcode stage: the blob

