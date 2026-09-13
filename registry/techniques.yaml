@@ -784,3 +784,35 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t029.md
         status: experimental
+
+  - id: ABR-T030
+    name: Host persistence toolkit - run keys, startup folder, auto-start service
+    description: >
+      The PERSIST task installs, removes and reports boot/logon
+      survival mechanisms in-process on the session thread
+      (advapi32/kernel32 resolved on demand). Mechanisms: registry Run
+      key (HKCU and HKLM via RegCreateKeyExW/RegSetValueExW), the
+      per-user Startup folder (binary copy) and an auto-start SCM
+      service (CreateServiceW, WIN32_OWN_PROCESS, ERROR_IGNORE - not
+      started at install, a running copy would be a second beacon).
+      The persisted binary defaults to a copy of the implant dropped as
+      %APPDATA%\<name>.exe; the operator can point at a staged exe.
+      list reads the live state of every mechanism; remove uninstalls
+      by name (lab hygiene). Detection is deliberately the mature
+      counterweight of this technique: Sysmon 12/13 run-key sets,
+      EID 11 Startup drops, EID 7045/4697 service installs all fire -
+      T1547.001/T1543.003/T1547 sigma families unchanged. The
+      scheduled-task (ITaskService COM) and WMI event-subscription COM
+      vectors are documented follow-ups.
+    mitre_attack:
+      - T1547.001
+      - T1543.003
+      - T1547
+    component: implant::persist
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t030.md
+        status: experimental

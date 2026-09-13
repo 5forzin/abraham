@@ -130,6 +130,10 @@ impl App {
                         .into(),
                 );
                 self.push_log(
+                    "  persist <id> <install|remove|list> [mechanism] [name] [args]  host persistence (T030: run-key, run-key-hklm, startup, service)"
+                        .into(),
+                );
+                self.push_log(
                     "  driver <id> load <svc> <src> <dst>   stage+start kernel driver (ABR-T013)"
                         .into(),
                 );
@@ -189,6 +193,18 @@ impl App {
                     "path"
                 };
                 Some(json!({ "cmd": "runpe", "session": id, key: rest }))
+            }
+            Some("persist") if tokens.len() >= 3 => {
+                // persist <id> <install|remove|list> [mechanism] [name] [args...]
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                let action = tokens[2];
+                let mechanism = tokens.get(3).copied().unwrap_or("run-key");
+                let name = tokens.get(4).copied().unwrap_or("abraham");
+                let args = tokens.get(5..).map(|t| t.join(" ")).unwrap_or_default();
+                Some(json!({
+                    "cmd": "persist", "session": id, "action": action,
+                    "mechanism": mechanism, "name": name, "args": args,
+                }))
             }
             Some("psrun") if tokens.len() >= 3 => {
                 let id: u32 = tokens[1].parse().unwrap_or(0);

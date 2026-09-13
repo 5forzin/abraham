@@ -137,6 +137,27 @@ Supported shape: `no_std`/loader-light payloads — CRT/TLS-heavy exes
 (rust `std`, full MSVC CRT) fault without the loader (documented);
 use `exec`/`execasm`/`psrun` for those.
 
+## Host persistence tasks (ABR-T030)
+
+`persist <id> <install|remove|list> [mechanism] [name] [args...]`
+installs, removes and reports boot/logon survival in-process
+(default mechanism `run-key`, default name `abraham`):
+
+- `run-key` / `run-key-hklm` — `...\CurrentVersion\Run` value (HKLM
+  needs elevation)
+- `startup` — copy of the implant in the per-user Startup folder
+- `service` — auto-start SCM service (elevation; NOT started at
+  install — it survives reboots, a running copy would be a second
+  beacon)
+
+The persisted binary defaults to a copy of the implant dropped as
+`%APPDATA%\<name>.exe` (override with an uploaded path via the mgmt
+`exe` field). `persist <id> list <mechanism> <name>` reports the live
+state of every mechanism; `remove` uninstalls by name. Detection
+coverage here is mature by design (Sysmon 12/13, 11, 7045/4697) — see
+`docs/detections/abr-t030.md`. The schtasks/WMI-subscription COM
+vectors are documented follow-ups.
+
 ## Shellcode tasks (ABR-T022)
 
 `exec <id> <local-file>` queues an in-process shellcode stage: the blob
