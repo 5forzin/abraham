@@ -816,3 +816,38 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t030.md
         status: experimental
+
+  - id: ABR-T031
+    name: In-process collection - screenshot, clipboard, per-cycle keylogging
+    description: >
+      The COLLECT task family, executed on the session thread. Screenshot:
+      virtual-screen BitBlt into top-down BGRA, PNG through WIC accessed
+      as raw COM vtables resolved on demand (factory CreateStream /
+      CreateEncoder / CreateNewFrame / SetSize / SetPixelFormat 32bppBGRA
+      / WritePixels / Commit, size via IStream Stat), automatic BMP
+      fallback on any WIC failure - nothing touches disk. Clipboard:
+      point-in-time CF_UNICODETEXT read. Keylog: GetAsyncKeyState
+      sampled across all virtual keys at every beacon wake-up into a
+      capped in-memory buffer, returned and cleared by the keylog
+      action - deliberately NO dedicated thread, because ekko sleep
+      obfuscation (T006) encrypts the implant image while the session
+      thread sleeps and a second thread executing implant code inside
+      that window would fault; coverage therefore equals beacon
+      cadence (documented limitation, syscalls-only stub thread is the
+      follow-up). Detection gap by design: no SetWindowsHookEx, no
+      child processes, no temp files - the classic T1113/T1115/
+      T1056.001 native-log families have nothing to see; compensating
+      sensors must hook GDI capture and GetAsyncKeyState from
+      non-UI processes.
+    mitre_attack:
+      - T1113
+      - T1115
+      - T1056.001
+    component: implant::collect
+    phase: 4
+    status: stable
+    lab_validated: 2026-09-12
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t031.md
+        status: experimental

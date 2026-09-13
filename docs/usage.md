@@ -158,6 +158,19 @@ coverage here is mature by design (Sysmon 12/13, 11, 7045/4697) — see
 `docs/detections/abr-t030.md`. The schtasks/WMI-subscription COM
 vectors are documented follow-ups.
 
+## Collection tasks (ABR-T031)
+
+`collect <id> <screenshot|clipboard|keylog>`:
+
+- `screenshot` — virtual-screen capture as PNG (WIC; BMP fallback),
+  lands in `loot/session-N/task-M.bin` via the chunked path
+- `clipboard` — point-in-time CF_UNICODETEXT read
+- `keylog` — dumps and clears the keystroke buffer. Keystrokes are
+  sampled with `GetAsyncKeyState` at every beacon wake-up (no hook, no
+  thread — the ekko sleep window forbids a second thread executing
+  implant code), so coverage equals the beacon cadence: lower the
+  sleep before a keylogging window, raise it after.
+
 ## Shellcode tasks (ABR-T022)
 
 `exec <id> <local-file>` queues an in-process shellcode stage: the blob
