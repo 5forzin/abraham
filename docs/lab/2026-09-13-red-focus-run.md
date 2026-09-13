@@ -153,3 +153,56 @@ the same sacrificial DLL carved in the same position on every implant.
 Every candidate that maps remains eligible; failing maps (locked,
 missing, section too small) just advance the wrap-around. Detection
 doc and registry updated with the widened tripwire set.
+
+## Part 5 — The CLR regression hunt (and what the bench is for)
+
+The first post-change bench caught what no isolated test could: psrun
+and execasm failing inside the full implant on the lab VM while every
+direct test — debug and release, host and guest — passed. The hunt:
+
+1. **Host bisect with kill-switches** (env-gated pieces of the arm):
+   gating unwind, VEH, stomp or the helper individually still killed
+   `CorBindToRuntimeEx` (0x80004005); only everything-off survived.
+   The single culprit by elimination: the debug-register write itself —
+   `SetThreadContext` poisons the thread for a subsequent runtime bind,
+   helper-thread or self.
+2. **Redesign**: arm moved to a post-CLR-start hook (SuppressHook between
+   Start and ExecuteInDefaultAppDomain), self-set + SwitchToThread
+   instead of suspend/set/resume (no second thread), and an `unpatch`
+   that restores the patched bytes when the breakpoints take over.
+   Direct tests passed everywhere again — the host suite went green.
+3. **The bench disagreed**: on the VM the full implant still failed the
+   managed tasks. A git-worktree commit bisection (baseline → T036 →
+   Sleep2 → stomp → profile, one plain bench each) pinned the break on
+   the T036 commit; the baseline rerun delivered 4/4.
+4. **Root causes accepted as facts**: the ETW patch landing on a
+   mid-initialized CLR kills it (System.ArithmeticException inside the
+   managed EventProvider) — so the byte patch must precede Start; and on
+   hypervisor builds the DR readback can pass while execution never
+   honors the breakpoints (the opt-in scenario leaked 28 CLR events
+   through the unpatched ETW).
+5. **Resolution**: ABR-T036 became opt-in (`--evasion ...hwbp`). The
+   default CLR path is bit-for-bit the baseline (patch before start,
+   no hook), the flag carries the post-start arm + unpatch design for
+   hosts measured to honor debug-register writes, and the detection
+   doc records the boundary.
+
+Final scorecard: `lab/bench/scorecard-2026-09-13-final.md` — default
+scenarios 4/4 tasks, implant ETW zero, Defender zero, pe-sieve hooked
+3-5 (the T024 patch, as baseline); the opt-in scenario documents its
+own leak. Also this part: benchasm is always regenerated (a cached
+assembly from an older source broke execasm with 0x80131513), the
+clipboard test became a diagnostic (host clipboard held open
+chronically), and the LSASS ignored-test confirms this host now denies
+process access (0xC0000022 - protected process policy).
+
+## Part 6 — Deploy and live validation
+
+`push.sh` redeployed avln (BUILD-STATUS:0, stage sha256
+2241469adeb0db29789c5d38e9b1742cc58c242058e73cad84064d671a86d955,
+live hash identical behind the Cloudflare front; the operational embed
+keeps `evasion: ""` - ekko and hwbp stay opt-in per operator choice).
+The downloaded stage registered two live 0.2.0 sessions on the host
+(cookie demux, idle 204s, UA-pool-capable profile), a `module whoami`
+task round-tripped queued -> delivered -> result (VAQKntho@VAQK
+pid=33300 integrity=medium), and the demos were stopped cleanly.
