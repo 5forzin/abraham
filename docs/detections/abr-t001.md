@@ -92,3 +92,15 @@ Implant against the teamserver in the VM lab, Sysmon 15.22 recording:
   malleable metadata.
 - Evidence: `lab/captures/abraham-vm_sysmon-https_2026-09-10.xml` and
   `docs/lab/2026-09-10-vm-validation.md`.
+
+## UA pool and extra headers (2026-09-13)
+
+Profiles can now carry a User-Agent pool and literal extra headers.
+Detection nuance: a per-session stable UA is what real browsers do, so a
+fleet of implants each holding a DIFFERENT consistent UA is harder to
+correlate by UA alone — pivot instead on the behavioral pair (same
+cookie name + same URI set + same cadence across IPs). The extra
+headers are verbatim: a header set that never varies byte-for-byte
+across thousands of requests is fingerprintable the same way — treat a
+static header ORDER + static casing as the long-term correlation key,
+since browsers reorder and re-case with updates.

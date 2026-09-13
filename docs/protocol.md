@@ -271,11 +271,24 @@ uris:                # implant picks one at random per request
   - /api/v1/telemetry
   - /cdn/update
 user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
+user_agents:         # optional UA pool: one stable pick per session
+  - "Mozilla/5.0 ... Chrome/131 ..."
+  - "Mozilla/5.0 ... Firefox/133 ..."
+headers:             # optional literal headers on every implant POST
+  - [Accept-Language, "en-US,en;q=0.9"]
+  - [sec-ch-ua-platform, ""Windows""]
 server_header: nginx # Server header on responses
 cookie_name: sid     # session cookie the demux token rides in (0.2.0)
 sleep_secs: 5        # default poll interval (overridable via SLEEP task)
 jitter: 0.25         # +/- 25% randomization of sleep
 ```
+
+`user_agents` (when non-empty) supersedes `user_agent` on the implant
+side: the pick is made once per session — browsers keep their UA for a
+session's lifetime, and a per-request rotation is its own anomaly. The
+`headers` pairs are emitted verbatim on every request; no templating.
+The teamserver ignores both (malleability is client-side; the server
+always answers with `server_header`).
 
 The teamserver serves every tasking exchange on any listed URI with the
 configured `Server` header; everything else 404s. Changing a profile on the
