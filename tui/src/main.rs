@@ -189,6 +189,45 @@ impl App {
                 let args = tokens[3..].join(" ");
                 Some(json!({ "cmd": "module", "session": id, "name": name, "args": args }))
             }
+            Some("cfg") if tokens.len() >= 2 => {
+                // cfg list | cfg add <rule-json> | cfg remove <index> |
+                // cfg test <domain> <hostname> <user> <ip>
+                match tokens[1] {
+                    "list" => Some(json!({ "cmd": "cfg", "action": "list" })),
+                    "add" if tokens.len() >= 3 => {
+                        let text = tokens[2..].join(" ");
+                        match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(rule) => {
+                                Some(json!({ "cmd": "cfg", "action": "add", "rule": rule }))
+                            }
+                            Err(e) => {
+                                self.push_log(format!("cfg add: invalid JSON ({e})"));
+                                None
+                            }
+                        }
+                    }
+                    "remove" if tokens.len() >= 3 => {
+                        let index: u64 = tokens[2].parse().unwrap_or(u64::MAX);
+                        Some(json!({ "cmd": "cfg", "action": "remove", "index": index }))
+                    }
+                    "test" if tokens.len() >= 3 => {
+                        let empty = String::new();
+                        Some(json!({
+                            "cmd": "cfg", "action": "test",
+                            "domain": tokens.get(2).copied().unwrap_or(&empty),
+                            "hostname": tokens.get(3).copied().unwrap_or(&empty),
+                            "user": tokens.get(4).copied().unwrap_or(&empty),
+                            "ip": tokens.get(5).copied().unwrap_or(&empty),
+                        }))
+                    }
+                    _ => {
+                        self.push_log(
+                            "usage: cfg list | cfg add <rule-json> | cfg remove <index> | cfg test <domain> <host> <user> <ip>".to_string(),
+                        );
+                        None
+                    }
+                }
+            }
             Some("exec") if tokens.len() >= 4 => {
                 let id: u32 = tokens[1].parse().unwrap_or(0);
                 Some(json!({ "cmd": "exec", "session": id, "source": tokens[3] }))

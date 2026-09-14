@@ -175,6 +175,21 @@ terminates the outer TLS (the CDN edge always does) — a per-host
 correlation handle for beacon traffic, joining requests of one implant
 process even as its origin connections churn.
 
+### 5.2 Server-driven configuration (T037)
+
+Implants ≥ 0.2.1 accept a `CONFIG` frame (kind `0x10`) inside any frame
+body. The teamserver resolves each implant against an operator-managed
+rule table (`cfg` mgmt commands; persisted as `config-rules.json` next
+to the session state): rules match domain, hostname prefix, username
+and the client's real netblock (fronting-proxy headers), and the FIRST
+matching rule resolves to an update — `sleep_secs`, `jitter`, URI pool,
+User-Agent pool; absent fields keep the implant's current values (KEEP
+sentinels). The update rides the REGISTER response and the first poll
+after a rule change; idle polls remain body-less 204s. Kill date and
+activation gates are not server-configurable. Older implants never
+receive the frame (strict decode would fail it), so the server gates
+delivery by reported build version.
+
 ## 6. Message types
 
 | Type | Name | Direction | Purpose |
@@ -189,6 +204,7 @@ process even as its origin connections churn.
 | `0x08` | `SLEEP` | server → implant | Update poll interval and jitter |
 | `0x09` | `ERROR` | both | Structured error (code + message) |
 | `0x0A` | `BATCH_END` | server → implant | Terminates the batch returned for a `TASK_POLL` |
+| `0x10` | `CONFIG` | server → implant | Server-driven configuration update (ABR-T037): rides the REGISTER response or the first poll after a rule change; implants ≥ 0.2.1 only |
 
 Task batching: the implant sends `TASK_POLL` and the teamserver responds with
 zero or more `TASK`/`CHUNK` frames terminated by a single `BATCH_END`. The
@@ -294,6 +310,8 @@ The teamserver serves every tasking exchange on any listed URI with the
 configured `Server` header; everything else 404s. Changing a profile on the
 server applies to new connections; running implants pick up `sleep_secs` /
 `jitter` only through the `SLEEP` task.
+
+
 
 ### 8.1 Embedded deployment configuration (T035)
 

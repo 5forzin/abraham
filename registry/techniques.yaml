@@ -1000,3 +1000,35 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t036.md
         status: experimental
+
+  - id: ABR-T037
+    name: Server-driven configuration over the beacon channel
+    description: >
+      The teamserver carries an operator-managed rule table
+      (config-rules.json, persisted beside the session state). Each
+      rule matches an implant's registration context - domain, hostname
+      prefix, username and the client's real IPv4 netblock from the
+      fronting proxy headers (CF-Connecting-IP / X-Forwarded-For; the
+      connection peer is the edge) - and resolves to a configuration
+      update: beacon sleep_secs/jitter, URI pool and User-Agent pool.
+      First matching rule wins; the manual SLEEP task remains the
+      single-session instant override and coexists. Updates ride the
+      sealed frame channel (kind 0x10) inside the REGISTER response
+      and inside the first poll after the operator changes the
+      resolution, gated to implants >= 0.2.1 whose decoder knows the
+      kind; idle polls stay body-less 204s. Kill date and activation
+      gates are deliberately not server-configurable. The detection
+      counterpart is behavioral: beacon cadence shifts (periodicity
+      analysis over netflow) and the one-frame response-size spike at
+      register/rule-change; steady state is indistinguishable from the
+      pre-T037 beacon.
+    mitre_attack:
+      - T1071.001
+    component: abraham_common::message + server + implant
+    phase: 5
+    status: experimental
+    lab_validated: 2026-09-14
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t037.md
+        status: experimental

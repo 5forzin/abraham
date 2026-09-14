@@ -310,6 +310,35 @@ accepting commands and audits refusals.
 
 Downloads land in `loot/session-<id>/task-<n>.bin`.
 
+
+### Server-driven configuration (T037)
+
+The teamserver can retune each implant's beacon timing and transport
+blending from rule context, without touching the machines. Rules match
+an implant's registration attributes — `match_domain`,
+`match_hostname_prefix`, `match_user` and `match_net` (IPv4 CIDR
+against the client's real address, read from the fronting proxy's
+`CF-Connecting-IP`/`X-Forwarded-For`) — and the FIRST match resolves to
+`sleep_secs`, `jitter`, `uris` and `user_agents`. Unlisted fields keep
+whatever the implant already runs. Updates ride the REGISTER response
+and the first poll after a rule change; idle polls stay 204s. Implants
+older than 0.2.1 never receive the frame (delivery is version-gated).
+
+```console
+$ python deploy/avln/mgmt.py '{"cmd":"cfg","action":"add","rule":{"note":"fiap lab fast","match_domain":"FIAP","sleep_secs":2,"jitter":0.1}}'
+$ python deploy/avln/mgmt.py '{"cmd":"cfg","action":"test","domain":"FIAP","hostname":"PA202MICRO35","user":"labsfiap","ip":"200.1.2.3"}'
+$ python deploy/avln/mgmt.py '{"cmd":"cfg","action":"list"}'
+$ python deploy/avln/mgmt.py '{"cmd":"cfg","action":"remove","index":0}'
+```
+
+TUI equivalents: `cfg list` / `cfg add <rule-json>` / `cfg remove <i>` /
+`cfg test <domain> <host> <user> <ip>`. The rule table persists beside
+the session state (`config-rules.json`); every change bumps an epoch and
+is audited (`config_rule_changed`, `config_delivered`). The manual `sleep`
+task still works as the single-session instant override. Removing a rule
+does NOT revert implants already reconfigured — publish a rule with the
+default values instead.
+
 ### Operator web UI
 
 The additive Three.js operator interface lives in `web/`. Configure

