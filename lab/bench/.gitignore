@@ -1,6 +1,9 @@
 # Sensor binaries fetched per-host (see README.md for pinned versions).
+# Diagnostic probe sources (.ps1/.cs) are tracked; their run outputs
+# (.txt/.log) are not.
 tools/*.exe
 tools/*.txt
+tools/*.log
 tools/vr-test.ps1
 tools/etw-test.ps1
 tools/pe-test.ps1

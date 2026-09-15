@@ -11,15 +11,23 @@
 # Scenario name -> implant --evasion value mapping is fixed below; add
 # entries there when new scenarios appear (hwbp, sleep2, ...).
 
+# Lab credentials are never hardcoded here: vmrun needs the VMX
+# encryption password (-vp) and the guest logon (-gp), both supplied
+# via environment variables or explicit parameters.
+#   $env:ABRAHAM_VP = '<vmx encryption password>'
+#   $env:ABRAHAM_GP = '<guest password>'
 param(
     [string[]]$ScenarioNames = @('plain', 'ekko', 'ekko-ppid'),
     [int]$Cycles = 20,
     [string]$Repo = "C:\Users\antho\Desktop\Workstation\projects\abraham",
     [string]$Vmx = "C:\Users\antho\Documents\Virtual Machines\Windows 11\Windows 11 x64.vmx",
-    [string]$Vp = "sfor!@24",
+    [string]$Vp = $env:ABRAHAM_VP,
     [string]$Gu = "lab",
-    [string]$Gp = "P@ssw0rd!"
+    [string]$Gp = $env:ABRAHAM_GP
 )
+if (-not $Vp -or -not $Gp) {
+    throw "ABRAHAM_VP / ABRAHAM_GP are not set (VMX and guest passwords)"
+}
 
 # NOTE: no $ErrorActionPreference='Stop' here — cargo writes progress to
 # stderr, and PS 5.1 turns native stderr into terminating errors under
@@ -36,6 +44,9 @@ $scenarioMap = @{
     # Opt-in ABR-T036: expect the fallback (byte patch) on virtualized
     # labs where debug-register writes are discarded.
     'hwbp'      = 'ekko,hwbp'
+    # Opt-in ABR-T041: guard-page interposition — patch-free AND
+    # DR-free, the variant that survives VBS. Expect pe-sieve hooked=0.
+    'guard'     = 'ekko,guard'
 }
 
 function Guest([string]$interpreter, [string]$script) {
@@ -66,6 +77,7 @@ $staged = @(
     @{ local = "$Repo\target\release\abraham-implant.exe"; remote = 'C:\bench\tools\abraham-implant.exe' },
     @{ local = "$Repo\lab\bench\bench.ps1";                remote = 'C:\bench\bench.ps1' },
     @{ local = "$Repo\lab\bench\drscan.ps1";               remote = 'C:\bench\drscan.ps1' },
+    @{ local = "$Repo\lab\bench\guardscan.ps1";           remote = 'C:\bench\guardscan.ps1' },
     @{ local = "$Repo\lab\bench\tools\pe-sieve64.exe";     remote = 'C:\bench\tools\pe-sieve64.exe' },
     @{ local = "$Repo\tools\psboot.cs";                   remote = 'C:\bench\tools\psboot.cs' }
 )

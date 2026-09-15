@@ -124,12 +124,17 @@ $implant = Start-Process -FilePath $implantExe -ArgumentList $implantArgs `
     -RedirectStandardError "$Out\implant.log" -RedirectStandardOutput "$Out\implant.out.log"
 Log "implant pid $($implant.Id) args: $implantArgs"
 
-# --- 4. drscan sampler in the background ------------------------------------
+# --- 4. drscan + guardscan samplers in the background ------------------------
 $drOut = Join-Path $Out 'drscan.jsonl'
 $drLoops = [Math]::Max(4, [int]($Cycles * $SleepSecs / 2))
 Start-Process -FilePath "powershell" `
     -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$BenchDir\drscan.ps1`" -TargetPid $($implant.Id) -Loop $drLoops -IntervalSec 2" `
     -WindowStyle Hidden -RedirectStandardOutput $drOut | Out-Null
+# ABR-T041 sensor: PAGE_GUARD on image pages of the implant process.
+$gsOut = Join-Path $Out 'guardscan.jsonl'
+Start-Process -FilePath "powershell" `
+    -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"& { 1..$drLoops | ForEach-Object { powershell -NoProfile -File `"$BenchDir\guardscan.ps1`" -TargetPid $($implant.Id) | Out-File -Append -Encoding ascii '$gsOut'; Start-Sleep 2 } }`"" `
+    -WindowStyle Hidden | Out-Null
 
 # --- 5. wait for the session to register ------------------------------------
 $sessionId = $null
@@ -266,6 +271,15 @@ try {
     $summary.drscan_nonzero = $nonZero.Count
     $nonZero | Set-Content (Join-Path $Out 'drscan-hits.jsonl')
 } catch { $summary.drscan_samples = 0 }
+
+# 9d-2. guardscan hits (ABR-T041 sensor).
+try {
+    $gs = @(Get-Content $gsOut -ErrorAction Stop)
+    $gsHits = @($gs | Where-Object { $_ -match 'GUARD-ON-IMAGE' })
+    $summary.guardscan_samples = $gs.Count
+    $summary.guardscan_hits = $gsHits.Count
+    $gsHits | Set-Content (Join-Path $Out 'guardscan-hits.jsonl')
+} catch { $summary.guardscan_hits = 0 }
 
 # 9e. pe-sieve: /quiet writes the human summary to stdout; the exit code
 #     is "1 = something dumped", which is a finding, not an error.

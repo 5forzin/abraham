@@ -28,6 +28,11 @@ cache/
 
 # Deploy scratch (built stage binaries)
 deploy/avln/.build/
+deploy/contabo/.build/
+
+# Agent session scratch + lab server pid file
+.zcode/
+*.pid
 
 # Operator web UI
 web/node_modules/
