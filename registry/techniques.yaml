@@ -1032,3 +1032,133 @@ techniques:
       - type: guidance
         path: docs/detections/abr-t037.md
         status: experimental
+  - id: ABR-T038
+    name: WMI event-subscription persistence
+    description: >
+      Stealth survival (T1546.003): an hourly Win32_LocalTime
+      __EventFilter, a CommandLineEventConsumer pointing at the implant
+      copy in %APPDATA% and the __FilterToConsumerBinding, all in
+      root\subscription. Nothing lands in Run keys, the Startup folder
+      or the SCM database, so Autoruns' default view and every
+      registry-diff hunt come back empty. The subscription is created
+      by the TEAMSERVER composing an in-process PowerShell task
+      (ABR-T026 machinery: AMSI/ETW patched on the session thread) -
+      no wmic.exe or powershell.exe child, no service install event at
+      creation time. Writing root\subscription requires an elevated
+      implant. Detection is honest about the asymmetry: install-time
+      is invisible to default Sysmon configs (the WMI event section
+      19/20/21 is opt-in), while fire-time leaves a hard IOC - a
+      process spawn with parent WmiPrvSE.exe - plus periodic repo
+      hunts for the three objects.
+    mitre_attack:
+      - T1546.003
+    component: server (mgmt persist wmi -> ABR-T026 PowerShell task) + tools/psboot.cs
+    phase: 5
+    status: experimental
+    lab_validated: 2026-09-15
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t038.md
+        status: experimental
+  - id: ABR-T039
+    name: Onboarding playbooks
+    description: >
+      Operational flow automation (C2.003-adjacent infrastructure
+      behavior): a server-side rule (same matcher as ABR-T037) carries
+      a playbook - a list of operator-shaped task specs ("module
+      survey", "collect screenshot", "relocate C:\ProgramData\Sysnet
+      Sysnet.exe run-key respawn") - that the teamserver queues the
+      moment a NEW matching session registers. The implant's first
+      poll carries the whole chain, so the operator opens a fresh
+      session to survey output and a settled-in resident instead of
+      typing first actions by hand. Delivery is exactly once per
+      session (session_new only; reconnects and relocation respawns
+      resume and never replay), specs are validated at cfg add time,
+      and steps needing a newer implant than the one that registered
+      are skipped and audited rather than queued blind. Detection is
+      behavioral on the wire (first-poll burst at machine speed after
+      REGISTER, symmetric result back-flow) plus the constituent
+      techniques' own host coverage.
+    mitre_attack:
+      - T1059
+    component: server (cfg rules + session_new hook) + tui (cfg mirror)
+    phase: 5
+    status: experimental
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t039.md
+        status: experimental
+  - id: ABR-T040
+    name: Self-install relocation
+    description: >
+      Implant lifecycle hygiene (T1105/T1547-adjacent): a RELOCATE task
+      copies the running image to a durable home (operator-chosen
+      directory, hidden+system attributes), optionally arms an
+      ABR-T030 mechanism against the NEW copy, and respawns from it -
+      handing the session token and the staging path through the
+      environment so the teamserver RESUMES the same session and the
+      resident copy deletes the stage after its first live link. All
+      in-process on the session thread (std::fs copy, kernel32
+      SetFileAttributesW and a CreateProcessW spawn with
+      CREATE_NO_WINDOW - no shell). Closes the operational loop:
+      stage -> relocate -> resident copy + survival + no stage left
+      behind. Detection couples the classic dropper chain (hidden exe
+      in ProgramData, self-hash parent/child spawn, run-key write,
+      stage deletion by its own child) with the honest gaps (respawn:
+      false trades continuity for silence).
+    mitre_attack:
+      - T1105
+      - T1074.001
+    component: implant (relocate.rs) + server (mgmt relocate) + protocol kind 0x10
+    phase: 5
+    status: experimental
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t040.md
+        status: experimental
+  - id: ABR-T041
+    name: Guard-page AMSI/ETW interposition
+    description: >
+      Patch-free AND debug-register-free AMSI/ETW suppression
+      (T1562.001): the 4KB pages of ntdll!EtwEventWrite and
+      amsi.dll!AmsiScanBuffer are re-protected orig|PAGE_GUARD, and a
+      hand-assembled VEH on the external code page (stomped-DLL home,
+      unwind metadata - survives .text encryption) retires execution
+      faults at both functions with the clean return values (ETW
+      STATUS_SUCCESS drop, AMSI S_OK + AMSI_RESULT_CLEAN through the
+      6th argument at [Rsp+0x30]), redirects Rip to an out-of-page
+      ret, and re-arms both guards with RAW
+      NtProtectVirtualMemory syscalls (the first cut called
+      kernel32!VirtualProtect from the handler and died: kernelbase's
+      own ETW emission faulted on the still-guarded page and recursed
+      the handler to stack death). Page-mate faults set the trap flag
+      and single-step until Rip leaves the guarded pages, then clear
+      TF and re-arm; foreign guard violations (stack growth) pass
+      through untouched. Module bytes stay pristine for memory
+      scanners (pe-sieve hooked: 0) and no debug-register write
+      exists for a hypervisor to discard - the variant that survives
+      the VBS builds that kill ABR-T036. Opt-in via --evasion ...guard
+      with automatic T024 byte-patch fallback; preferred over the
+      patch when set, stands down if T036 breakpoints arm. Detection
+      counterpart is a VirtualQuery hunt: PAGE_GUARD on MEM_IMAGE
+      pages (nothing legitimate guards ntdll .text) - shipped as
+      lab/bench/guardscan.ps1. Measured honestly on the virtualized
+      lab: ntdll/amsi pristine to pe-sieve (vs hooked under the
+      default patch), arm-time retirement proven, but a steady-state
+      leak of 95 DotNETRuntime events (vs 0 with the patch) under
+      the multithreaded CLR ETW storm - the trade is a small
+      telemetry leak for a pristine memory image. Validation also
+      fixed a latent T036 bug live (AMSI 6th-arg offset) that DR-less
+      hosts could never exercise.
+    mitre_attack:
+      - T1562.001
+    component: implant (evasion/guard.rs, handler assembled by .zcode/gen_guard.py)
+    phase: 5
+    status: experimental
+    detections:
+      - type: guidance
+        path: docs/detections/abr-t041.md
+        status: experimental
+      - type: guidance
+        path: lab/bench/guardscan.ps1
+        status: experimental

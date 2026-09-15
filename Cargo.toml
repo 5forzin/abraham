@@ -5,8 +5,10 @@ members = ["common", "implant", "server", "tui"]
 [workspace.package]
 # 0.2.0 gates the empty-poll 204 on the teamserver (implants report
 # their version at REGISTER; older builds keep receiving sealed empty
-# batches) and the cookie-carried session token.
-version = "0.2.1"
+# batches) and the cookie-carried session token. 0.2.1 gates CONFIG
+# frames (ABR-T037). 0.2.2 gates the RELOCATE task (ABR-T040) — older
+# decoders fail the frame as malformed.
+version = "0.2.2"
 edition = "2021"
 authors = ["Anthony Sforzin"]
 license = "MIT"

