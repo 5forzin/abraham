@@ -56,3 +56,18 @@ Take a screenshot mid-exercise, exfiltrate, and show which (if any)
 sensor flagged it — then the same for clipboard and a keylog dump
 while typing canary text into notepad. The report documents the real
 T1113/T1115/T1056.001 coverage posture of the lab stack.
+
+Measured in the lab (2026-09-14, `lab/fulltest.ps1` lane C4):
+
+- An implant dropped through guest-automation (session 0, no
+  interactive desktop) fails the capture cleanly with
+  `BitBlt/GetDIBits failed` — the module reports the environment,
+  nothing crashes, no partial leak.
+- The same binary launched in the interactive console session (an
+  `/IT` scheduled task, i.e. the context a T040 run-key resident gets
+  at logon) captures and exfiltrates a real PNG (2.35 MB for the
+  1920×1080 lab desktop, PNG magic verified in loot).
+- Detection takeaway for the blue side: the interesting event is a
+  NON-UI process in a USER session touching GDI screen capture — a
+  service-session process simply cannot, which is itself a useful
+  triage signal (which context a suspicious process lives in).

@@ -267,6 +267,12 @@ Phase 4 addition:
 | `0x0E` | CRED | Credential access (ABR-T032/T033): `action` u8 (0=LSASS user-mode dump, 1=LSASS kernel-attach dump), `arg` string reserved. Result is the `%TEMP%` dump path |
 | `0x0F` | EXECBOF | COFF object execution (ABR-T034): `data` blob (the .obj, 48 KB cap) + `args` blob (pre-packed Beacon convention buffer) |
 
+Phase 5 addition:
+
+| task_type | Name | Notes |
+|---|---|---|
+| `0x10` | RELOCATE | Self-install relocation (ABR-T040, 0.2.2+ builds): `dir` string, `name` string, `persist` string (optional mechanism armed against the copy), `respawn` u8. Copies the running image to `dir\name` (hidden+system), optionally installs the persistence mechanism, and when `respawn` spawns the copy — resume token (`ABRAHAM_RESUME` hex) and staging path (`ABRAHAM_OLD_PATH`) via the environment so the server resumes the session and the resident copy deletes the stage after its first link — then exits. Older decoders reject the frame, so servers version-gate delivery |
+
 ### 6.3 RESULT payload
 
 | Field | Type | Notes |

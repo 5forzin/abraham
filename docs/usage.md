@@ -76,8 +76,14 @@ capabilities (comma-separated): `ekko` encrypts the executable section
 during each sleep (waitable-timer APC + RC4), `ppid` spawns shell tasks
 under a spoofed parent with a fallback to plain spawning where the OS
 rejects the attribute (see `docs/detections/abr-t007.md` for the
-Windows 11 25H2 findings). Default: all off. Reconnection backs off
-exponentially (5 s doubling to 300 s, jittered) after consecutive
+Windows 11 25H2 findings), `hwbp` opts into ABR-T036 (AMSI/ETW via
+debug registers — measured dead on VBS/hypervisor builds), and `guard`
+opts into ABR-T041: AMSI/ETW suppression via guard-page interposition
+— zero byte patches, zero debug registers, the variant that survives
+VBS. The CLR tasks prefer `guard` over the legacy T024 patch when set
+(the patch stays as fallback if arming is refused) and stand the guard
+down if `hwbp` breakpoints arm. Default: all off. Reconnection backs
+off exponentially (5 s doubling to 300 s, jittered) after consecutive
 failures and resets once a session reaches the beacon loop.
 
 ## Module tasks (preferred over shell)
@@ -155,8 +161,29 @@ The persisted binary defaults to a copy of the implant dropped as
 `exe` field). `persist <id> list <mechanism> <name>` reports the live
 state of every mechanism; `remove` uninstalls by name. Detection
 coverage here is mature by design (Sysmon 12/13, 11, 7045/4697) — see
-`docs/detections/abr-t030.md`. The schtasks/WMI-subscription COM
-vectors are documented follow-ups.
+`docs/detections/abr-t030.md`. The schtasks COM vector is a documented
+follow-up.
+
+### WMI event-subscription persistence (ABR-T038)
+
+`persist <id> <install|remove|list> wmi <name>` — the stealth variant:
+an hourly `Win32_LocalTime` filter, a `CommandLineEventConsumer` on the
+implant copy and the binding, all in `root\subscription`. Nothing in
+Run keys, Startup or the service database; the subscription is created
+through the implant's in-process PowerShell runspace (ABR-T026), so
+no `wmic`/`powershell.exe` child appears at install. Requires an
+elevated session (writing `root\subscription`). The command is
+teamserver-composed: on a Linux teamserver the PowerShell bootstrap
+cache must be seeded once — compile `tools/psboot.cs` on any Windows
+host with the in-box csc and drop the assembly at `cache/psboot.dll`
+next to the server state; on a Windows teamserver the first call
+compiles it automatically.
+
+Detection is asymmetric and documented honestly in
+`docs/detections/abr-t038.md`: invisible to default Sysmon configs at
+install, but every hourly fire leaves a process spawn with parent
+`WmiPrvSE.exe`, and at-rest hunts of `root\subscription` find the
+three objects.
 
 ## Collection tasks (ABR-T031)
 
@@ -338,6 +365,47 @@ is audited (`config_rule_changed`, `config_delivered`). The manual `sleep`
 task still works as the single-session instant override. Removing a rule
 does NOT revert implants already reconfigured — publish a rule with the
 default values instead.
+
+### Onboarding playbooks (T039)
+
+The same rule table automates the first minute after a landing: any rule
+may carry a `playbook` — a list of task specs queued the instant a NEW
+matching session registers, so the implant's first poll already carries
+the chain and the operator opens the session to results. Specs mirror
+the verbs you already type:
+
+```jsonc
+{"note":"lab onboarding","match_domain":"LAB",
+ "sleep_secs":2,
+ "playbook":["module survey",
+             "collect screenshot",
+             "relocate C:\\ProgramData\\Sysnet Sysnet.exe run-key respawn"]}
+```
+
+Supported specs: `module <name> [args…]`, `collect
+<screenshot|clipboard|keylog>`, `sleep <secs> [jitter]`, `persist
+install <mechanism> <name>`, `relocate <dir> <name> [mechanism]
+[respawn]` (0.2.2+ builds only — older implants get the step skipped and
+audited, never a frame they cannot decode). Specs are validated at `cfg
+add` time; delivery happens exactly once per session (`session_new`
+only — reconnects and relocation respawns resume and never replay) and
+is audited as `playbook_queued` per step.
+
+### Self-install relocation (T040)
+
+`relocate <id> <dir> <name> [persist-mechanism] [norespawn]` turns a
+freshly staged implant into a resident: it copies its own image to
+`<dir>\<name>` (hidden+system), optionally installs a persistence
+mechanism (ABR-T030 set) pointing at the copy, then respawns from the
+new home with `CREATE_NO_WINDOW` — carrying the session token and old
+path through the environment, so the teamserver RESUMES the same session
+(id, queue, results) instead of opening a sibling, and the resident copy
+deletes the staging binary after its first live link. With `norespawn`
+it copies + persists without the spawn. The full flow — drop, check in,
+T037 config + T039 playbook, `relocate` — is the operational default
+lifecycle. Detection coverage is deliberately strong
+(`docs/detections/abr-t040.md`: hidden exe in ProgramData, self-hash
+parent/child, run-key write, stage deleted by its own child).
 
 ### Operator web UI
 
